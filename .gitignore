@@ -1,0 +1,10 @@
+node_modules/
+
+# Claude Code machine-local permission settings
+.claude/settings.local.json
+
+# Logs and local env
+*.log
+npm-debug.log*
+.env
+.env.local
