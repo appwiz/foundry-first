@@ -1,9 +1,9 @@
 {
   "name": "foundry-first",
   "version": "1.0.0",
-  "description": "",
-  "license": "ISC",
-  "author": "",
+  "description": "Minimal CLI that runs a local LLM through the Foundry Local SDK",
+  "license": "GPL-3.0-or-later",
+  "author": "Rohan Deshpande",
   "type": "module",
   "main": "index.js",
   "scripts": {
