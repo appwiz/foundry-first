@@ -1,5 +1,5 @@
 /*
- * foundry-first — run a local LLM through the Foundry Local SDK.
+ * foundry-first — local-first LLM routing with frontier escalation.
  * Copyright (C) 2026 Rohan Deshpande
  *
  * This program is free software: you can redistribute it and/or modify
@@ -16,45 +16,235 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { FoundryLocalManager } from 'foundry-local-sdk';
+import { loadLocalModel, sampleLocal, selectRepresentative } from './lib/local.js';
+import { scoreSamples, shouldEscalate } from './lib/confidence.js';
+import { escalate, credentialHint, FRONTIER_MODEL } from './lib/frontier.js';
+import * as metrics from './lib/metrics.js';
+import { CALIBRATION_SET } from './lib/calibration.js';
 
-// Read and validate the user prompt before doing any expensive model work
-const prompt = process.argv.slice(2).join(' ');
-if (!prompt) {
-    console.error('Usage: node index.js <prompt>');
-    process.exit(1);
+const CONFIG = {
+    appName: 'my-app',
+    modelAlias: 'qwen2.5-0.5b',
+    sampleCount: 3,
+    // Must be non-zero. At temperature 0 the model is deterministic, every
+    // sample is identical, and agreement is a constant 1.0 that measures
+    // nothing. See lib/confidence.js.
+    temperature: 0.7,
+    localMaxTokens: 512,
+    // Load-bearing for the metric, not a style preference. Left unconstrained,
+    // this model wraps a stable answer in unstable prose — three samples all
+    // saying "H2O" scored 0.307 because the surrounding explanation differed
+    // every time. Suppressing the padding makes agreement measure the answer
+    // rather than the phrasing. See the Calibration section of README.md.
+    localSystemPrompt:
+        'Answer directly and concisely. State only the answer itself. '
+        + 'Do not explain your reasoning, restate the question, or add caveats unless explicitly asked.',
+    frontierMaxTokens: 64000,
+    // Calibrated, not chosen: `--calibrate` sweeps thresholds against a
+    // labelled easy/hard set and reports the best cut. 0.59 routes 11/12
+    // correctly; rounded up to 0.60 because the two error types differ in cost
+    // — an unnecessary escalation spends tokens, a hard question kept local
+    // presents a fabrication as fact. Re-run --calibrate after changing the
+    // model, sample count, or temperature.
+    threshold: 0.60,
+};
+
+function parseArgs(argv) {
+    const opts = { prompt: [], stats: false, calibrate: false, resetStats: false, localOnly: false, verbose: false };
+    for (let i = 0; i < argv.length; i += 1) {
+        const arg = argv[i];
+        switch (arg) {
+            case '--stats': opts.stats = true; break;
+            case '--calibrate': opts.calibrate = true; break;
+            case '--reset-stats': opts.resetStats = true; break;
+            case '--local-only': opts.localOnly = true; break;
+            case '--verbose': case '-v': opts.verbose = true; break;
+            case '--threshold': CONFIG.threshold = Number(argv[++i]); break;
+            case '--samples': CONFIG.sampleCount = Number(argv[++i]); break;
+            default: opts.prompt.push(arg);
+        }
+    }
+    opts.prompt = opts.prompt.join(' ');
+    return opts;
 }
 
-const manager = FoundryLocalManager.create({ appName: 'my-app' });
+const USAGE = `Usage: node index.js [options] "<prompt>"
 
-// Resolve the model (auto-selects best variant for user's hardware).
-const model = await manager.catalog.getModel('qwen2.5-0.5b');
+Answers locally when the local model is confident, escalating to ${FRONTIER_MODEL}
+when it is not. Confidence is measured by self-consistency across independently
+seeded samples — see README.md.
 
-// Foundry Local caches downloaded models on disk, so only fetch the weights
-// when this variant isn't already cached locally. Subsequent runs skip the
-// download entirely and go straight to load().
-if (model.isCached) {
-    console.log(`Model ${model.id} already cached, skipping download.`);
-} else {
-    await model.download((progress) => {
-        process.stdout.write(`\rDownloading... ${progress.toFixed(2)}%`);
-    });
-    process.stdout.write('\n');
-}
+Options:
+  --local-only        Never escalate; report what would have happened
+  --samples <n>       Samples drawn to measure agreement (default ${CONFIG.sampleCount})
+  --threshold <0-1>   Agreement below this escalates (default ${CONFIG.threshold})
+  --verbose, -v       Show per-sample drafts and the agreement score
+  --stats             Print cumulative routing metrics and exit
+  --reset-stats       Clear cumulative metrics and exit
+  --calibrate         Measure agreement across a labelled prompt set and exit`;
 
-await model.load();
-
-// Create a chat client and stream the completion, writing tokens as they arrive
-const chatClient = model.createChatClient();
-for await (const chunk of chatClient.completeStreamingChat([
-    { role: 'user', content: prompt }
-])) {
-    const content = chunk.choices?.[0]?.delta?.content;
-    if (content) {
-        process.stdout.write(content);
+function log(verbose, message) {
+    if (verbose) {
+        console.error(message);
     }
 }
-process.stdout.write('\n');
 
-// Unload the model when done
-await model.unload();
+/** Run the labelled calibration set and report where the threshold should sit. */
+async function runCalibration(model) {
+    console.log(`Calibrating on ${CALIBRATION_SET.length} prompts, ${CONFIG.sampleCount} samples each...\n`);
+    const rows = [];
+
+    for (const item of CALIBRATION_SET) {
+        const { samples } = await sampleLocal(model, item.prompt, CONFIG);
+        const score = scoreSamples(samples);
+        rows.push({ ...item, agreement: score.agreement, disqualified: score.disqualifiers.length > 0 });
+        const flag = score.disqualifiers.length > 0 ? ' [disqualified]' : '';
+        console.log(`  ${score.agreement.toFixed(3)}  ${item.tier.padEnd(9)} ${item.prompt.slice(0, 52)}${flag}`);
+    }
+
+    const easy = rows.filter((r) => r.tier === 'easy').map((r) => r.agreement);
+    const hard = rows.filter((r) => r.tier === 'hard').map((r) => r.agreement);
+    const mean = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;
+    const min = (xs) => Math.min(...xs);
+    const max = (xs) => Math.max(...xs);
+
+    console.log(`\n  easy  n=${easy.length}  mean ${mean(easy).toFixed(3)}  min ${min(easy).toFixed(3)}`);
+    console.log(`  hard  n=${hard.length}  mean ${mean(hard).toFixed(3)}  max ${max(hard).toFixed(3)}`);
+
+    const gap = min(easy) - max(hard);
+    console.log(`\n  separation gap ${gap.toFixed(3)}`);
+
+    // Sweep candidate thresholds rather than taking the midpoint of the gap.
+    // Midpoint is only optimal when the classes separate cleanly; where they
+    // overlap it is just a point inside the overlap with no claim to
+    // minimising error, and can sit well away from the best cut.
+    let bestT = 0;
+    let bestErrors = Infinity;
+    let bestConfusion = null;
+    for (let t = 0; t <= 1.0001; t += 0.01) {
+        // Matches shouldEscalate: escalate when agreement < threshold.
+        const easyEscalated = rows.filter((r) => r.tier === 'easy' && r.agreement < t).length;
+        const hardKeptLocal = rows.filter((r) => r.tier === 'hard' && r.agreement >= t).length;
+        const errors = easyEscalated + hardKeptLocal;
+        if (errors < bestErrors) {
+            bestErrors = errors;
+            bestT = t;
+            bestConfusion = { easyEscalated, hardKeptLocal };
+        }
+    }
+
+    if (gap > 0) {
+        console.log('  classes separate cleanly.');
+    } else {
+        console.log('  classes overlap — no threshold separates them perfectly on this set.');
+    }
+    console.log(`  best threshold ${bestT.toFixed(2)} — ${rows.length - bestErrors}/${rows.length} correctly routed`);
+    console.log(`    ${bestConfusion.easyEscalated} easy escalated unnecessarily (costs tokens)`);
+    console.log(`    ${bestConfusion.hardKeptLocal} hard kept local (risks a confident wrong answer)`);
+    console.log('\n  Those two errors are not equally bad: an unnecessary escalation costs');
+    console.log('  tokens, while a hard question kept local surfaces a fabrication as fact.');
+    console.log('  Round the threshold up when in doubt.');
+}
+
+async function main() {
+    const opts = parseArgs(process.argv.slice(2));
+
+    if (opts.resetStats) {
+        metrics.save(CONFIG.appName, metrics.empty());
+        console.log(`Metrics cleared: ${metrics.metricsPath(CONFIG.appName)}`);
+        return;
+    }
+
+    if (opts.stats) {
+        console.log(metrics.format(metrics.summarize(metrics.load(CONFIG.appName))));
+        console.log(`\n  ${metrics.metricsPath(CONFIG.appName)}`);
+        return;
+    }
+
+    if (!opts.prompt && !opts.calibrate) {
+        console.error(USAGE);
+        process.exit(1);
+    }
+
+    // ---- Local tier -------------------------------------------------------
+    const { model } = await loadLocalModel({
+        appName: CONFIG.appName,
+        alias: CONFIG.modelAlias,
+        onDownloadProgress: (p) => process.stdout.write(`\rDownloading model... ${p.toFixed(1)}%`),
+    });
+
+    try {
+        if (opts.calibrate) {
+            await runCalibration(model);
+            return;
+        }
+
+        const { samples, latencyMs, localTokens } = await sampleLocal(model, opts.prompt, CONFIG);
+        const score = scoreSamples(samples);
+        const decision = shouldEscalate(score, CONFIG.threshold);
+
+        if (opts.verbose) {
+            samples.forEach((s, i) => {
+                log(true, `  [draft ${i + 1}] (${s.finishReason}) ${s.text.trim().replace(/\s+/g, ' ').slice(0, 110)}`);
+            });
+            log(true, `  agreement ${score.agreement.toFixed(3)} vs threshold ${CONFIG.threshold} — ${decision.escalate ? 'ESCALATE' : 'LOCAL'}\n`);
+        }
+
+        let entry = { localTokens, localLatencyMs: latencyMs, escalated: false };
+
+        if (!decision.escalate) {
+            console.log(selectRepresentative(samples).text.trim());
+            console.error(`\n[local · agreement ${score.agreement.toFixed(2)} · ${latencyMs}ms · 0 frontier tokens]`);
+        } else if (opts.localOnly) {
+            console.log(selectRepresentative(samples).text.trim());
+            console.error(`\n[local-only · would have escalated: ${decision.reason}]`);
+        } else {
+            // The frontier tier can fail for reasons outside our control —
+            // absent credentials, network, rate limits. None of those should
+            // cost the user the answer we already have in hand, so degrade to
+            // the local draft rather than exiting empty-handed.
+            try {
+                entry = await runEscalation(opts, samples, decision, entry);
+            } catch (err) {
+                entry.escalationFailed = true;
+                console.log(selectRepresentative(samples).text.trim());
+                console.error(`\n[local fallback · escalation needed (${decision.reason}) but unavailable]`);
+                console.error(`  ${err.message.split('\n')[0]}`);
+                if (!credentialHint()) {
+                    console.error('  Set ANTHROPIC_API_KEY, or run `ant auth login`, to enable the frontier tier.');
+                }
+            }
+        }
+
+        const updated = metrics.record(metrics.load(CONFIG.appName), entry);
+        metrics.save(CONFIG.appName, updated);
+    } finally {
+        await model.unload();
+    }
+}
+
+async function runEscalation(opts, samples, decision, entry) {
+    console.error(`[escalating to ${FRONTIER_MODEL} — ${decision.reason}]\n`);
+    const result = await escalate(opts.prompt, samples, decision.reason, {
+        onText: (delta) => process.stdout.write(delta),
+        maxTokens: CONFIG.frontierMaxTokens,
+    });
+    process.stdout.write('\n');
+
+    if (result.refused) {
+        console.error(`\n[frontier declined the request${result.refusalCategory ? ` (${result.refusalCategory})` : ''}]`);
+    } else {
+        console.error(`\n[frontier · ${result.servedBy} · ${result.latencyMs}ms · ${result.inputTokens + result.outputTokens} tokens]`);
+    }
+
+    return {
+        ...entry,
+        escalated: true,
+        refused: result.refused,
+        remoteInputTokens: result.inputTokens,
+        remoteOutputTokens: result.outputTokens,
+        remoteLatencyMs: result.latencyMs,
+    };
+}
+
+await main();

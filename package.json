@@ -10,6 +10,7 @@
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.115.0",
     "foundry-local-sdk-winml": "^1.2.3"
   }
 }

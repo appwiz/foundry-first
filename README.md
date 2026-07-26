@@ -1,16 +1,21 @@
 # foundry-first
 
-A minimal command-line chat client that runs a large language model **entirely on your own machine** — no cloud, no API key, no network round-trip at inference time.
+A command-line demonstration that **most questions can be answered on-device**, escalating to a frontier model only when the local model is measurably unsure.
 
-It is built on [Microsoft Foundry Local](https://learn.microsoft.com/azure/ai-foundry/foundry-local/), which wraps ONNX Runtime and ONNX Runtime GenAI behind a small JavaScript SDK. The whole application is one file, [`index.js`](index.js), kept deliberately short so the full lifecycle of a local model — resolve, download, load, infer, unload — is readable end to end.
+A small local model (Qwen2.5-0.5B, running in-process via [Microsoft Foundry Local](https://learn.microsoft.com/azure/ai-foundry/foundry-local/)) answers first. Its confidence is measured objectively. If it clears the bar, the answer is free, private, and offline. If it doesn't, the question escalates to [Claude Opus 5](https://platform.claude.com/docs/en/about-claude/models/overview) — carrying the local drafts along as context, so the work already done is reused rather than discarded.
+
+Every routing decision is recorded, so the value of the local tier is a measurement rather than a claim.
 
 ```console
 $ node index.js "What is the capital of France?"
-Model qwen2.5-0.5b-instruct-generic-cpu:4 already cached, skipping download.
-The capital of France is Paris. It's a beautiful city known for its rich history...
-```
+Paris
+[local · agreement 1.00 · 676ms · 0 frontier tokens]
 
-Tokens stream to stdout as they are generated.
+$ node index.js "Which amendment to the Icelandic fisheries act of 1990 introduced transferable quotas?"
+[escalating to claude-opus-5 — agreement 0.389 below threshold 0.600]
+...
+[frontier · claude-opus-5 · 4.2s · 1,847 tokens]
+```
 
 ---
 
@@ -19,16 +24,14 @@ Tokens stream to stdout as they are generated.
 - [Requirements](#requirements)
 - [Quickstart](#quickstart)
 - [Design](#design)
-  - [Why Foundry Local](#why-foundry-local)
-  - [Execution model](#execution-model)
-  - [Lifecycle](#lifecycle)
-  - [Design decisions](#design-decisions)
+  - [Why route at all](#why-route-at-all)
+  - [The confidence signal](#the-confidence-signal)
+  - [Calibrating the threshold](#calibrating-the-threshold)
+  - [What the metric cannot see](#what-the-metric-cannot-see)
+  - [Escalation](#escalation)
+  - [Metrics](#metrics)
 - [Developing](#developing)
-  - [Project layout](#project-layout)
-  - [Making local changes](#making-local-changes)
-  - [Where things live on disk](#where-things-live-on-disk)
-  - [Debugging](#debugging)
-  - [Troubleshooting](#troubleshooting)
+- [Troubleshooting](#troubleshooting)
 - [License](#license)
 
 ---
@@ -37,10 +40,11 @@ Tokens stream to stdout as they are generated.
 
 | | |
 |---|---|
-| **OS** | Windows 10/11 on x64. See [Other platforms](#other-platforms) below. |
+| **OS** | Windows 10/11 on x64. See [Other platforms](#other-platforms). |
 | **Node.js** | v18+ for top-level `await` and native ESM. Developed against v24.18.0. |
-| **Disk** | ~46 MB of native runtime libraries, plus model weights — ~840 MB for the default model. |
-| **Network** | Only for the first run, to download the runtime and model. Inference is fully offline. |
+| **Disk** | ~46 MB of native runtime libraries, plus ~840 MB of model weights. |
+| **Network** | First run only, for the local tier. The frontier tier needs network when it fires. |
+| **Credentials** | `ANTHROPIC_API_KEY`, or an `ant auth login` profile. **Optional** — without it the local tier still works and escalation degrades gracefully. |
 
 ## Quickstart
 
@@ -51,231 +55,210 @@ npm install
 node index.js "Explain the Monty Hall problem in two sentences."
 ```
 
-The first `npm install` downloads platform-specific native libraries (~47 MB). The first `node index.js` downloads the model weights and prints a progress bar; every run after that starts straight from the local cache.
+The first `npm install` fetches platform-specific native libraries. The first run downloads model weights with a progress bar; later runs start from the local cache.
+
+To enable the frontier tier:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...   # or: ant auth login
+```
+
+### Options
+
+```
+--local-only        Never escalate; report what would have happened
+--samples <n>       Samples drawn to measure agreement (default 3)
+--threshold <0-1>   Agreement below this escalates (default 0.60)
+--verbose, -v       Show per-sample drafts and the agreement score
+--stats             Print cumulative routing metrics
+--reset-stats       Clear cumulative metrics
+--calibrate         Measure agreement across a labelled prompt set
+```
 
 ---
 
 ## Design
 
-### Why Foundry Local
+### Why route at all
 
-Running an LLM locally normally means picking up a stack of concerns — obtaining weights in the right quantization, choosing an execution provider matching the hardware, managing the runtime's memory lifecycle, and exposing an inference API. Foundry Local bundles these behind one SDK:
+A 0.5B-parameter model runs on any laptop CPU, costs nothing per token, and never sends a keystroke off the machine. It is also wrong a great deal of the time. A frontier model inverts every one of those properties.
 
-- **A model catalog** that resolves a friendly alias (`qwen2.5-0.5b`) to the concrete build best suited to the current machine (`qwen2.5-0.5b-instruct-generic-cpu:4`).
-- **A managed cache**, so weights are fetched once and reused across processes.
-- **An OpenAI-shaped API surface**, so the message and response formats are the same ones used against hosted models — porting code between local and cloud is mostly a matter of swapping the client.
+Neither is the right default. The useful question is not "which model" but "**can this one be trusted with this particular question**" — and answering it requires a confidence signal the router can act on before showing the user anything.
 
-This project is the smallest useful thing built on that foundation: a single-turn chat CLI.
+### The confidence signal
 
-### Execution model
+The textbook signal is **token-level logprobs**: average the log-probability of each generated token and you have the model's own uncertainty, in nats, for free.
 
-The SDK is not a network client talking to a background server. It loads a **native addon** into the Node process and calls into it over FFI:
+**Foundry Local does not expose them.** Both paths were checked:
 
-```mermaid
-flowchart TD
-    A["index.js<br/>(your code)"] --> B["foundry-local-sdk<br/>(JavaScript)"]
-    B --> C["Native addon<br/>(FFI boundary)"]
-    C --> D["Microsoft.AI.Foundry.Local.Core.dll"]
-    D --> E["onnxruntime-genai.dll"]
-    E --> F["onnxruntime.dll"]
-    F --> G["Execution provider<br/>CPU / GPU / NPU"]
-    G --> H["Model weights<br/>(on-disk cache)"]
+| Path | Result |
+|---|---|
+| FFI chat completions (`completeChat`) | `choices[0].logprobs` is `undefined` — the field is absent entirely |
+| HTTP Responses API (`createResponsesClient`) | The field exists on the response but returns `[]`, and `ResponseCreateParams` has no parameter to request it |
+
+So this project uses **self-consistency**, the standard substitute.
+
+The same prompt is sampled K times (default 3) at a fixed non-zero temperature, each with a distinct fixed seed. That draws K independent samples from the model's output distribution. **Agreement between those samples is an empirical estimator of that distribution's entropy** — the same quantity logprobs would have measured directly. A model that knows an answer converges on it; a model that is guessing produces a different guess each time.
+
+This is objective in the sense that matters: it is computed from observed outputs, and never asked of the model. Asking a model to rate its own confidence returns a self-report, which is a different and much weaker thing.
+
+Agreement is the mean pairwise **Szymkiewicz–Simpson overlap coefficient** over content words, with two refinements that calibration forced:
+
+**Numeric disagreement is decisive.** Word overlap alone is too forgiving on quantitative questions — asked for a figure it doesn't know, the model emits the same confident sentence with a different number each time, and the shared prose carries the score. "GDP per capita of Botswana in 1987" scored **0.778 on words alone** while every sample named a different figure. So when samples quote numbers, the pair scores no higher than the agreement between those numbers: a disagreement of fact cannot be papered over by agreement of phrasing.
+
+**Output is format-constrained.** This is load-bearing for the metric, not a style preference. Left to ramble, the model wraps a stable answer in unstable prose — three samples all correctly saying `H2O` scored **0.307**, because the surrounding explanation differed every time. A system prompt suppressing explanation makes agreement measure the answer rather than the phrasing. That single change moved the mean agreement on known-easy prompts from **0.601 to 0.941**.
+
+Two objective facts about the generation bypass the score entirely and force escalation, because they make agreement meaningless:
+
+- **`finish_reason === 'length'`** — the sample was cut off mid-answer, so agreement between fragments proves nothing.
+- **A sample with no content words** — nothing to agree about.
+
+### Calibrating the threshold
+
+The threshold is not a guess. `lib/calibration.js` holds twelve prompts labelled in two classes — `easy` (well within a 0.5B model's competence; *should* stay local) and `hard` (obscure specifics and multi-step reasoning; *should* escalate). `--calibrate` scores every prompt and reports where the classes separate:
+
+```console
+$ node index.js --calibrate
+  1.000  easy      What is the chemical symbol for water?
+  0.500  easy      Name the largest ocean on Earth.
+  0.500  hard      What was the exact GDP per capita of Botswana in 1987...
+  0.000  hard      Which specific amendment to the Icelandic fisheries...
+
+  easy  n=6  mean 0.917  min 0.500
+  hard  n=6  mean 0.374  max 0.587
+
+  separation gap -0.087
+  best threshold 0.59 — 11/12 correctly routed
+    1 easy escalated unnecessarily (costs tokens)
+    0 hard kept local (risks a confident wrong answer)
 ```
 
-The practical consequences are worth internalizing:
+The threshold is found by **sweeping** candidate values and counting misclassifications, not by taking the midpoint between the classes — midpoint is only optimal when they separate cleanly, and here they overlap.
 
-- **The model lives in this process.** Its memory is the Node process's memory, and it is released when the process exits or `unload()` is called — whichever comes first.
-- **There is no server to start** for chat completions. That is why the code never mentions a port or a base URL.
-- **Native libraries must match the platform**, because DLLs are not portable. This is the single most common source of setup failure; see [Troubleshooting](#troubleshooting).
+The default **0.60** rounds the measured 0.59 up, because the two error types are not equally bad. An unnecessary escalation costs tokens; a hard question kept local presents a fabrication as fact. At 0.60 no hard prompt in the set stays local.
 
-There *is* an optional HTTP path — `manager.startWebService()` exposes an OpenAI-compatible endpoint, and `createResponsesClient(baseUrl)` speaks the Responses API over it. This project does not use it. The in-process FFI path avoids the serialization hop and keeps the program to one moving part.
+Re-run `--calibrate` after changing the model, the sample count, or the temperature. The separation point is a property of *the model*, not of the metric.
 
-### Lifecycle
+### What the metric cannot see
 
-Everything in [`index.js`](index.js) is one linear pass, using top-level `await` (enabled by `"type": "module"` in [`package.json`](package.json)):
+The negative separation gap above is a real finding, reported rather than tuned away. Two cases overlap, and each illustrates a genuine limit:
 
-| Stage | Call | Notes |
-|---|---|---|
-| 1. Read input | `process.argv.slice(2).join(' ')` | Exits with a usage message when empty, before any expensive work. |
-| 2. Initialize | `FoundryLocalManager.create({ appName })` | Boots the native core. Returns a **singleton** — repeat calls hand back the same instance. |
-| 3. Resolve | `manager.catalog.getModel('qwen2.5-0.5b')` | Alias → best variant for this hardware. |
-| 4. Download | `model.download(onProgress)` | Skipped when `model.isCached`. Progress callback receives 0–100. |
-| 5. Load | `model.load()` | Reads weights into memory / onto the accelerator. The slow step on a warm cache. |
-| 6. Infer | `chatClient.completeStreamingChat(messages)` | Returns an `AsyncIterable` of OpenAI-shaped chunks. |
-| 7. Release | `model.unload()` | Frees the model. |
+**Confident hallucination reads as confidence.** Asked to name the largest ocean, the model says *Pacific* every time — then volunteers a fabricated statistic, differently each time (196,087,534 km² vs 148,000 km²). Escalating is arguably correct here, but the general point stands: **self-consistency measures conviction, not accuracy**, and a model reliably wrong in the same way scores high. Logprobs share this weakness exactly.
 
-### Design decisions
+**Agreement on scaffolding is not agreement on substance.** On the train-timing problem, all three samples open with near-identical boilerplate — *"To determine when the trains meet, we need to calculate…"* — and none reaches an answer. The score reflects agreement on how to *start*, and any text-similarity measure inherits this blind spot.
 
-**Validate the prompt first.** Argument checking happens at the top of the file, before the manager is constructed. Initializing the native core and resolving a model take real time; there is no reason to pay that cost only to discover the user passed no prompt.
+Both are inherent to the approach rather than bugs. A larger labelled set and a task-aware similarity measure would narrow the overlap; neither would eliminate it.
 
-**Check the cache explicitly.** `download()` is safe to call unconditionally, but branching on `model.isCached` lets the program say *why* it is fast on a warm start rather than appearing to hang or silently no-op. Observable behavior beats a clever one-liner in a program meant to be read.
+### Escalation
 
-**Stream rather than block.** `completeChat()` resolves once with the finished response; `completeStreamingChat()` yields chunks as the model produces them. For a CLI where a small model still takes seconds to finish a paragraph, streaming turns dead air into visible progress. The cost is a slightly more involved consumer:
+When the local tier falls short, the question goes to **`claude-opus-5`** with the disagreeing local drafts attached as context. The system prompt frames them as evidence of what the small model found uncertain — not as authority — so the frontier model builds on what is right and silently corrects what is not. This is what makes the result a *combined* answer rather than a plain remote one.
 
-```js
-for await (const chunk of chatClient.completeStreamingChat(messages)) {
-    const content = chunk.choices?.[0]?.delta?.content;
-    if (content) {
-        process.stdout.write(content);
-    }
-}
+The call uses adaptive thinking, streams tokens as they generate, and opts into server-side refusal fallbacks (`fallbacks: "default"`), which re-route a declined request to Anthropic's recommended fallback model rather than returning a refusal.
+
+Escalation failure — absent credentials, network, rate limits — never costs the user an answer. The local draft is printed with a clear note, and the request is recorded as a failed escalation rather than a local success.
+
+### Metrics
+
+Cumulative counters persist to `%USERPROFILE%\.my-app\router-metrics.json`.
+
+```console
+$ node index.js --stats
+  Requests                3
+  Answered locally        2  (100.0%)
+  Escalated               0
+  Escalations failed      1  (excluded from rate)
+
+  Local tokens            600  (free, on-device)
+  Frontier tokens spent   0  (0 in / 0 out)
 ```
 
-The optional chaining is load-bearing. Chunks carry `delta.content` (an increment) rather than `message.content` (the whole reply), and the field is **absent** on the first and last chunks — those carry role and finish-reason metadata instead. Without the guard, the stream would print `undefined` at both ends.
+Two properties are worth stating plainly, because savings figures invite overclaiming:
 
-**Use `create()`, not `createAsync()`.** `create()` blocks the event loop during initialization. In a CLI that has nothing else to do, that is fine and keeps the code linear. A server or GUI should use `createAsync()` instead, so initialization does not stall other work.
+**Savings are counterfactual and labelled as such.** We never made the calls we avoided, so their cost cannot be measured — only estimated. The estimate prices each avoided call at the **measured mean** of the escalations that actually happened. Until at least one escalation completes there is no baseline, and the figures report `n/a` rather than guessing.
 
-**Unload explicitly.** Process exit would release the model anyway. The call is kept because it marks the end of the lifecycle for a reader, and because it is exactly what a longer-lived program *must* do to avoid pinning hundreds of megabytes.
+**Failed escalations count as neither.** A request the router judged too hard for the local tier, where the frontier tier then failed, is not local sufficiency. Counting it as such would inflate the headline number with exactly the requests that disprove it, so it is tracked separately and excluded from the rate.
 
-**Default to a very small model.** `qwen2.5-0.5b` has 0.5 billion parameters — small enough to download quickly and run on a plain CPU with no GPU. It is chosen to prove the plumbing works on any machine, not for answer quality. Expect it to be confidently wrong on occasion; the sample output above wanders into questionable claims about Parisian dialects.
+Actual frontier token counts come from the API's own `usage` field, and local counts from the SDK's — both exact.
 
 ---
 
 ## Developing
 
-### Project layout
+No build step. Edit and re-run.
 
 ```
 foundry-first/
-├── index.js            # The entire application
-├── package.json        # ESM, one dependency
-├── package-lock.json
-├── LICENSE             # GPL-3.0
-└── .gitignore          # Excludes node_modules/ and machine-local settings
+├── index.js              # CLI, routing orchestration, calibration harness
+├── lib/
+│   ├── local.js          # Local sampling, model lifecycle, medoid selection
+│   ├── confidence.js     # Agreement metric and escalation policy
+│   ├── frontier.js       # Anthropic escalation
+│   ├── metrics.js        # Persistent counters
+│   └── calibration.js    # Labelled prompt set
+└── LICENSE               # GPL-3.0
 ```
 
-`node_modules/` is **not** committed. It holds ~47 MB of platform-specific native binaries that would break a clone on any other OS.
+**Tune the routing.** All knobs live in the `CONFIG` object at the top of [`index.js`](index.js): model alias, sample count, temperature, threshold, token limits, and the local system prompt. `--samples` and `--threshold` override the last two per-run.
 
-### Making local changes
+**Trade cost against sensitivity.** Confidence costs K local inferences per question — the price of an objective metric when logprobs are unavailable. Raising `--samples` sharpens the estimate and slows every request; lowering it to 2 is the cheapest measurement possible, since one sample has nothing to compare against.
 
-Edit [`index.js`](index.js) and re-run — there is no build step. The project is plain ESM JavaScript executed directly by Node.
+**Swap the local model.** Change `modelAlias` in `CONFIG`, then **re-run `--calibrate`** — a different model has a different separation point, and the inherited threshold will be wrong.
 
-**Change the model.** Swap the alias on the `getModel` line:
+**Change the confidence metric.** [`lib/confidence.js`](lib/confidence.js) is self-contained: `scoreSamples` produces the score, `shouldEscalate` applies the policy. If a future SDK release populates `logprobs`, mean log-probability drops in as a replacement for `scoreSamples` with nothing else changing.
 
-```js
-const model = await manager.catalog.getModel('phi-3.5-mini');
+**Inspect a routing decision.** `--verbose` prints each draft with its finish reason and the resulting score:
+
+```console
+$ node index.js -v --local-only "Name the largest ocean on Earth."
+  [draft 1] (stop) The largest ocean by area is the Pacific Ocean, which has an estimated 196,087,534 km².
+  [draft 2] (stop) The largest ocean by area is the Pacific Ocean, which has an area of approximately 148,000 square kilometers.
+  [draft 3] (stop) The largest ocean on Earth is the Pacific Ocean.
+  agreement 0.500 vs threshold 0.6 — ESCALATE
 ```
-
-To see what is available, list the catalog:
-
-```js
-const models = await manager.catalog.getModels();
-console.log(models.map((m) => `${m.alias}  (${m.id})`).join('\n'));
-```
-
-Related catalog methods: `getModelVariant(id)` for a specific build, `getCachedModels()` for what is already downloaded, `getLoadedModels()` for what is resident, and `getLatestVersion(model)` to check for a newer build.
-
-**Tune sampling.** The chat client exposes settings that map onto the usual OpenAI parameters. Set them after creating the client, before completing:
-
-```js
-const chatClient = model.createChatClient();
-chatClient.settings.temperature = 0.2;
-chatClient.settings.maxTokens = 512;
-chatClient.settings.randomSeed = 42;    // reproducible output
-```
-
-Also available: `topP`, `topK`, `frequencyPenalty`, `presencePenalty`, `n`, `responseFormat` (for JSON-mode style constrained output), and `toolChoice`.
-
-**Hold a conversation.** The SDK is stateless between calls — it does not track history for you. Multi-turn means accumulating the array yourself and passing the whole thing each time:
-
-```js
-const messages = [{ role: 'system', content: 'You are terse.' }];
-messages.push({ role: 'user', content: prompt });
-// ...stream the reply, collecting it into `reply`...
-messages.push({ role: 'assistant', content: reply });
-```
-
-Watch the model's `contextLength` — older turns must be dropped or summarized once the accumulated history approaches it.
-
-**Call tools.** Both completion methods take an optional second argument of tool definitions, in OpenAI's function-calling shape. Check `model.supportsToolCalling` first; not every catalog model does.
-
-**Use other modalities.** The same model object also exposes `createEmbeddingClient()` and `createAudioClient()`. `model.inputModalities` and `model.outputModalities` report what a given model actually supports.
-
-**Force a specific hardware variant.** `getModel()` auto-selects, but you can override:
-
-```js
-console.log(model.variants.map((v) => v.id));
-model.selectVariant(model.variants.find((v) => v.id.includes('gpu')));
-```
-
-Execution providers can be inspected and installed at runtime via `manager.discoverEps()` and `manager.downloadAndRegisterEps()`.
 
 ### Where things live on disk
 
-Paths derive from `appName`, which is `'my-app'` in this project — change it in the `create()` call and every path below moves with it.
+Paths derive from `appName` (`'my-app'`); changing it moves all of them and orphans the model cache.
 
-| What | Default location |
+| What | Location |
 |---|---|
-| App data root | `%USERPROFILE%\.my-app` |
 | Model cache | `%USERPROFILE%\.my-app\cache\models` |
+| Routing metrics | `%USERPROFILE%\.my-app\router-metrics.json` |
 | Logs | `%USERPROFILE%\.my-app\logs` |
 | Native libraries | `node_modules/foundry-local-sdk/foundry-local-core/<platform>-<arch>/` |
 
-All are overridable through the config object: `appDataDir`, `modelCacheDir`, `logsDir`, and `libraryPath`.
+---
 
-To reclaim disk space, call `model.removeFromCache()` or delete the cache directory — the next run re-downloads.
-
-### Debugging
-
-Raise the log level; it defaults to `warn`:
-
-```js
-const manager = FoundryLocalManager.create({
-    appName: 'my-app',
-    logLevel: 'debug',    // trace | debug | info | warn | error | fatal
-});
-```
-
-Logs are written to the logs directory above.
-
-To inspect the full, non-streamed response envelope — `choices`, `usage`, `finish_reason` — switch temporarily to the blocking call:
-
-```js
-const response = await chatClient.completeChat(messages);
-console.dir(response, { depth: null });
-```
-
-### Troubleshooting
+## Troubleshooting
 
 **`FoundryLocalCorePath not specified`**
 
-The native libraries for your platform are missing. The SDK looks for `foundry-local-core/<platform>-<arch>/`, and this error means that directory is absent or empty — most often because `node_modules` was copied from a machine with a different OS or CPU architecture, or because the install script did not complete.
-
-Fix it by reinstalling so the platform detection re-runs:
+Native libraries for your platform are missing — usually because `node_modules` was copied from a machine with a different OS or architecture. Reinstall so platform detection re-runs:
 
 ```bash
 rm -rf node_modules package-lock.json
 npm install
 ```
 
-A correct Windows x64 install contains five DLLs:
+A correct Windows x64 install has five DLLs under `foundry-local-core/win32-x64/`: `Microsoft.AI.Foundry.Local.Core.dll`, `Microsoft.Windows.AI.MachineLearning.dll`, `onnxruntime.dll`, `onnxruntime-genai.dll`, and `onnxruntime_providers_shared.dll`.
 
-```
-node_modules/foundry-local-sdk/foundry-local-core/win32-x64/
-├── Microsoft.AI.Foundry.Local.Core.dll
-├── Microsoft.Windows.AI.MachineLearning.dll
-├── onnxruntime.dll
-├── onnxruntime-genai.dll
-└── onnxruntime_providers_shared.dll
-```
+**Everything escalates / nothing escalates**
 
-If they still do not appear, point the SDK at them directly with the `libraryPath` config option.
+The threshold is calibrated for Qwen2.5-0.5B at temperature 0.7 with 3 samples. Change any of those and re-run `--calibrate`.
 
 **The import and the dependency have different names**
 
-[`package.json`](package.json) depends on `foundry-local-sdk-winml`, but [`index.js`](index.js) imports `foundry-local-sdk`. This is intentional, not a mistake. The `-winml` package contains no API of its own — it is an installer wrapper that declares `foundry-local-sdk` as a dependency and runs an install script fetching the **WinML** build of the native runtime (Windows ML 2.1.1, ONNX Runtime 1.26.0, ONNX Runtime GenAI 0.14.1) rather than the standard build. You install the variant; you import the base package.
+[`package.json`](package.json) depends on `foundry-local-sdk-winml` while [`index.js`](index.js) imports `foundry-local-sdk`. This is intentional. The `-winml` package ships no API of its own — it is an installer wrapper that declares `foundry-local-sdk` as a dependency and fetches the **WinML** build of the native runtime instead of the standard one. You install the variant; you import the base package.
 
 <a name="other-platforms"></a>
 **Other platforms**
 
-Swap the WinML wrapper for the base package, which ships native libraries for non-Windows targets:
+Swap the WinML wrapper for the base package, which ships native libraries for non-Windows targets. No change to the source is needed:
 
 ```bash
 npm uninstall foundry-local-sdk-winml
 npm install foundry-local-sdk
 ```
-
-No change to `index.js` is needed — the import path is already correct.
 
 ---
 
@@ -287,4 +270,4 @@ This program is free software: you can redistribute it and/or modify it under th
 
 This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the [GNU General Public License](LICENSE) for more details.
 
-The Foundry Local SDK itself is a separate work, distributed by Microsoft under the MIT license.
+The Foundry Local SDK and the Anthropic SDK are separate works, distributed by Microsoft and Anthropic respectively under the MIT license.

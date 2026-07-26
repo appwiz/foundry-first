@@ -4,16 +4,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A single-file CLI (`index.js`) that runs a local LLM in-process via Microsoft Foundry Local. [README.md](README.md) is comprehensive — it carries the user-facing design doc and developer instructions. This file covers what the README doesn't: the gotchas that required reading `node_modules` install scripts to establish.
+A CLI that answers with a local LLM (in-process via Microsoft Foundry Local) and escalates to `claude-opus-5` when the local model is measurably unsure. [README.md](README.md) is comprehensive — it carries the user-facing design doc and developer instructions. This file covers what the README doesn't: the gotchas that required reading `node_modules` install scripts or probing the runtime to establish.
+
+`index.js` is the CLI and routing orchestration; `lib/` holds the local tier, the confidence metric, the frontier tier, metrics, and the calibration set.
 
 ## Commands
 
 ```bash
 npm install                      # fetches ~46MB of native libs via install scripts
-node index.js "<prompt>"         # run — the only entry point
+node index.js "<prompt>"         # run
+node index.js --calibrate        # re-measure the confidence threshold
+node index.js --stats            # cumulative routing metrics
+node index.js -v --local-only "…" # inspect a routing decision without escalating
 ```
 
-There is **no build step, no linter, and no test suite**. `npm test` is npm's default placeholder and exits 1 by design. Verification means running the binary with a real prompt and reading the output — a change that "looks right" is not verified until inference actually completes.
+There is **no build step, no linter, and no test suite**. `npm test` is npm's default placeholder and exits 1 by design. Verification means running the binary with a real prompt and reading the output — a change that "looks right" is not verified until inference actually completes. `--local-only` makes that cheap: it exercises the whole local path and the routing decision without needing credentials or spending frontier tokens.
 
 First run downloads ~840MB of model weights; later runs hit the cache and start in seconds.
 
@@ -31,7 +36,17 @@ First run downloads ~840MB of model weights; later runs hit the cache and start 
 
 **Streaming chunks need the optional chaining.** `completeStreamingChat()` yields chunks carrying `choices[0].delta.content` — an increment, not the whole message. That field is **absent** on the first and last chunks, which carry role and finish-reason metadata. Dropping the `if (content)` guard prints `undefined` at both ends of every response.
 
-**Paths derive from `appName`.** `appName: 'my-app'` in the `create()` call determines `%USERPROFILE%\.my-app\` and therefore the model cache and log locations. Changing it orphans the existing 840MB cache and forces a re-download.
+**Paths derive from `appName`.** `appName: 'my-app'` in the `create()` call determines `%USERPROFILE%\.my-app\` and therefore the model cache, log, and routing-metrics locations. Changing it orphans the existing 840MB cache and forces a re-download.
+
+**Logprobs are unavailable — do not reach for them.** Established by probing both paths, not by reading docs. `completeChat()` omits `choices[0].logprobs` entirely; the HTTP Responses API declares the field on `OutputTextContent` but returns `[]`, and `ResponseCreateParams` has no parameter to request it. The `LogProb` type in `types.d.ts` is therefore a shape the local runtime never populates. This is why confidence is measured by self-consistency instead — if a future SDK release starts populating it, mean log-probability drops straight into `scoreSamples`.
+
+**Temperature must stay non-zero.** At temperature 0 the model is deterministic, every sample is identical, agreement is a constant 1.0, and the confidence signal silently carries no information. Nothing errors — the router just stops escalating.
+
+**The local system prompt is load-bearing for the metric, not cosmetic.** Suppressing explanation is what makes agreement measure the answer rather than the phrasing; removing it moved mean agreement on known-easy prompts from 0.941 back down to 0.601 and destroyed class separation. Same for the numeric-agreement rule in `pairAgreement` — without it, confidently-hallucinated figures score 0.778 on shared prose.
+
+**The threshold is calibrated, not chosen.** `--calibrate` scores a labelled easy/hard set and reports the separating point. Re-run it after changing the model, sample count, or temperature — the separation point is a property of the model. The classes currently overlap slightly (gap −0.087); that is a reported finding, not a bug to tune away.
+
+**Frontier tier: `claude-opus-5`, and the request shape is unverified.** No Anthropic credentials were available when the escalation path was written, so it has never completed a real call. It is known to construct and transmit — an invalid key returns 401 from the API — but a control test confirmed auth is checked *before* body validation, so that 401 proves nothing about whether the parameters are accepted. The first real call may surface a 400. Parameters follow the `claude-api` skill: adaptive thinking, streaming, and `fallbacks: "default"` with beta `server-side-fallback-2026-07-01` (note the array form of `fallbacks` uses a *different* header, `-2026-06-01`).
 
 ## Conventions
 
