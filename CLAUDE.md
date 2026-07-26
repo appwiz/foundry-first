@@ -47,3 +47,7 @@ First run downloads ~840MB of model weights; later runs hit the cache and start 
 ## Working agreement
 
 Establish facts from the code first, then give one recommended approach with a brief rationale. Do not present multiple-choice design menus unless the decision is genuinely irreversible — pick a sensible default and proceed.
+
+## Development
+
+Refine the README.md and this file as you learn more and implement changes. Keep the files in sync. Commit code and documentation together. Always push changes with a thoughtful commit message.
