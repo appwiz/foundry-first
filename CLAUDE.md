@@ -98,6 +98,34 @@ The `tr` matters — WSL emits a trailing CR that corrupts the header. The SDK s
 
 **Conditional per-platform dependency selection is unsolved and was left open.** npm skips an `optionalDependencies` entry only when the dependency's own manifest declares a mismatched `os`/`cpu`. Neither SDK package declares those fields, and `overrides` rewrites versions rather than manifests. Listing `foundry-local-sdk-winml` as optional would be actively harmful: `install-winml.cjs` does not bail on non-Windows — it gates only the `Microsoft.Windows.AI.MachineLearning` artifact behind `platform === 'win32'` and force-overwrites the rest on any platform, exiting 0 so npm has no failure to skip on. Verified alternative: the base `foundry-local-sdk` alone installs and runs inference correctly on Windows, resolving the same `qwen2.5-0.5b-instruct-generic-cpu:4` variant, so dropping the WinML variant is a viable one-line simplification that costs the Windows ML execution provider.
 
+## State of play
+
+Both tiers are verified end to end against real inference and a real API call. What follows is the resumable picture: measured baselines to compare a re-run against, and the threads left open.
+
+**Verified working.** Local sampling, `<think>` stripping, the agreement metric, the threshold sweep, escalation to `claude-opus-5` (real response, exact `usage`), streaming, graceful degradation when the frontier tier is unreachable, and metrics with a populated counterfactual baseline.
+
+**Current measured baselines** (qwen2.5-0.5b, temperature 0.7, 3 samples, 20-prompt set). Re-derive with `--compare` and `--calibrate` after any change to model, sample count, or temperature:
+
+| Measurement | Value |
+|---|---|
+| Threshold in use | 0.76 (from `--compare`, correctness-scored) |
+| Routing at that threshold | 9/20 local-correct, **0** local-wrong, 11 escalated |
+| Agreement, easy vs hard | 0.944 / 0.332 — separation gap −0.087 |
+| Label-scored threshold | 0.59, 19/20 (`--calibrate`; superseded by `--compare`) |
+| Frontier call | ~16s, ~1.5k tokens for a substantive answer |
+
+**Open threads, roughly by value:**
+
+1. **Only 5 of ~25 chat models in the catalog were benchmarked** — `qwen2.5-0.5b`, `qwen3-0.6b`, `qwen3.5-0.8b`, `qwen2.5-1.5b`, `phi-3.5-mini`. Untested and plausible: `smollm3-3b`, `qwen3.5-2b-text`, `qwen3-1.7b`, `ministral-3-3b`, `phi-4-mini`. Probe stochasticity first — three of five tested so far were greedy, so screening is cheap and eliminates most candidates before a full run.
+2. **The 20-prompt calibration set is small**, and the −0.087 class overlap is partly a small-sample artifact. Widening it would firm up the threshold and is the cheapest credibility win available.
+3. **`--calibrate` and `--compare` implement two different sweeps.** `--calibrate` scores against labels, `--compare` against correctness. Keeping both is defensible (they answer different questions) but the duplication invites drift; folding `--calibrate` into a view over `--compare` data would remove it.
+4. **The metric's blind spots are documented, not fixed** — confident hallucination reads as confidence, and agreement on reasoning scaffolding reads as agreement on substance. A task-aware similarity measure would narrow both.
+5. `adm-zip` and conditional per-platform dependencies remain as described under Known constraints — both are blocked upstream rather than unfinished here.
+
+**Not attempted, deliberately.** Multi-turn conversation (the SDK is stateless and the router is single-shot), tool calling, and the HTTP Responses API path.
+
+**To resume on another machine:** clone, `npm install`, then `node index.js --local-only "…"` exercises everything except the frontier tier without credentials. For the frontier tier, export `ANTHROPIC_API_KEY` or run `ant auth login` — the WSL bridge above is only needed where `ant` lives inside WSL rather than on the host. The first run re-downloads ~840MB of weights; `~/.my-app/` is machine-local and nothing in it needs to be carried across.
+
 ## Working agreement
 
 Establish facts from the code first, then give one recommended approach with a brief rationale. Do not present multiple-choice design menus unless the decision is genuinely irreversible — pick a sensible default and proceed.
