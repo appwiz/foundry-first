@@ -65,6 +65,12 @@ To enable the frontier tier:
 export ANTHROPIC_API_KEY=sk-ant-...   # or: ant auth login
 ```
 
+If `ant` is installed under WSL rather than Windows, its profile is invisible to the Windows process — bridge the token across, stripping the trailing CR that would otherwise corrupt the header:
+
+```bash
+export ANTHROPIC_AUTH_TOKEN=$(wsl ant auth print-credentials --access-token | tr -d '\r\n')
+```
+
 ### Options
 
 ```
@@ -235,6 +241,8 @@ Both are inherent to the approach rather than bugs. A larger labelled set and a 
 When the local tier falls short, the question goes to **`claude-opus-5`** with the disagreeing local drafts attached as context. The system prompt frames them as evidence of what the small model found uncertain — not as authority — so the frontier model builds on what is right and silently corrects what is not. This is what makes the result a *combined* answer rather than a plain remote one.
 
 The call uses adaptive thinking, streams tokens as they generate, and opts into server-side refusal fallbacks (`fallbacks: "default"`), which re-route a declined request to Anthropic's recommended fallback model rather than returning a refusal.
+
+The reuse is not cosmetic. Asked which amendment introduced Iceland's transferable fishing quotas, the local model confidently invented "Article 247-5-1"; given those drafts as context, the frontier model answered that **no amendment did** — transferability was in the original Act 38/1990 — correcting a false premise embedded in the question itself.
 
 Escalation failure — absent credentials, network, rate limits — never costs the user an answer. The local draft is printed with a clear note, and the request is recorded as a failed escalation rather than a local success.
 

@@ -59,11 +59,17 @@ First run downloads ~840MB of model weights; later runs hit the cache and start 
 
 **The metric works here partly *because* the model is weak.** A more capable, more self-consistent model agrees with itself even when fabricating, which is why the larger candidates score so badly rather than so well. Do not assume a bigger local model would improve routing — the benchmark says the opposite.
 
-**Frontier tier: `claude-opus-5`, and the request shape is still unverified.** Parameters follow the `claude-api` skill: adaptive thinking, streaming, and `fallbacks: "default"` with beta `server-side-fallback-2026-07-01` (note the array form of `fallbacks` uses a *different* header, `-2026-06-01`).
+**Frontier tier: `claude-opus-5` — verified end to end.** A real escalation returns content, so the request shape is confirmed accepted: adaptive thinking, streaming, and `fallbacks: "default"` with beta `server-side-fallback-2026-07-01` (note the array form of `fallbacks` uses a *different* header, `-2026-06-01`). Streaming, `usage` accounting, and metrics recording all work against the live API.
 
-Authentication works — `ant` is installed under WSL, and its OAuth token reaches the Windows process via `ANTHROPIC_AUTH_TOKEN=$(wsl ant auth print-credentials --access-token)`. The SDK accepts it and sets the Bearer header itself; no explicit `oauth-2025-04-20` beta was needed.
+**Testing it from this machine needs the WSL token bridge.** `ant` is installed under WSL, not Windows, so its OAuth profile is invisible to the Windows Node process. Pass it explicitly:
 
-What blocks verification is billing, not auth: the account returns `400 … credit balance is too low`. A four-way control — valid body, bogus beta header, and a `temperature` param that Opus 5 definitively rejects — returned that *same* error for every case, proving the credit check runs **before** body validation. So no request has ever been validated, and the first call on a funded account may still surface a parameter 400. Do not record this path as working until a real call returns content.
+```bash
+ANTHROPIC_AUTH_TOKEN=$(wsl ant auth print-credentials --access-token | tr -d '\r\n') node index.js "…"
+```
+
+The `tr` matters — WSL emits a trailing CR that corrupts the header. The SDK sets the Bearer header itself; no explicit `oauth-2025-04-20` beta is needed. Tokens are short-lived (~1h), so re-run the substitution rather than caching it.
+
+**A 400 here may say nothing about your request.** The billing check runs *before* body validation: on an account with no credits, a valid body, a bogus beta header, and a `temperature` param that Opus 5 definitively rejects all return the identical `credit balance is too low` error. When debugging a 400, confirm the account has credit before touching the parameters.
 
 ## Conventions
 
