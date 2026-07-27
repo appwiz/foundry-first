@@ -260,7 +260,22 @@ The call uses adaptive thinking, streams tokens as they generate, and opts into 
 
 The reuse is not cosmetic. Asked which amendment introduced Iceland's transferable fishing quotas, the local model confidently invented "Article 247-5-1"; given those drafts as context, the frontier model answered that **no amendment did** — transferability was in the original Act 38/1990 — correcting a false premise embedded in the question itself.
 
-Escalation failure — absent credentials, network, rate limits — never costs the user an answer. The local draft is printed with a clear note, and the request is recorded as a failed escalation rather than a local success.
+Escalation failure — absent credentials, network, rate limits — never costs the user an answer. The local draft is printed instead, and the request is recorded as a failed escalation rather than a local success.
+
+The **order** of that output matters. Escalation is announced before the call is attempted, so on failure the retraction and the low-confidence warning are printed *before* the answer:
+
+```
+[escalating to claude-opus-5 — agreement 0.000 below threshold 0.760]
+
+[escalation FAILED — Could not resolve authentication method...]
+  Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN, or run `ant auth login`.
+
+[showing the LOCAL answer instead — it was judged low confidence, so treat it with suspicion]
+
+1206
+```
+
+Printed the other way round, the local draft appears directly beneath "escalating to claude-opus-5" and reads as though the frontier model produced it — lending a fabrication the frontier model's authority. All the warnings go to stderr, so piping stdout still captures only the answer.
 
 ### Metrics
 

@@ -53,14 +53,18 @@ try {
     entry = await runEscalation(opts, samples, decision, entry);
 } catch (err) {
     entry.escalationFailed = true;
+    console.error(`[escalation FAILED — ${err.message.split('\n')[0]}]`);
+    console.error('\n[showing the LOCAL answer instead — it was judged low '
+        + 'confidence, so treat it with suspicion]\n');
     console.log(selectRepresentative(samples).text.trim());
-    console.error(`[local fallback · escalation needed (${decision.reason}) but unavailable]`);
 }
 ```
 
 Print the local answer, say plainly that it's a fallback and why. The user gets something, and knows what they're getting.
 
-Hold on to that `entry.escalationFailed = true` line. It exists because of a bug I'll get to in a moment.
+That ordering — warnings *before* the answer — is deliberate, and I got it wrong first. More on that at the end.
+
+Hold on to the `entry.escalationFailed = true` line too. It exists because of a bug I'll get to in a moment.
 
 ## Now: what does this actually save?
 
@@ -164,6 +168,38 @@ The same trap sprang again later. With credits still absent, a valid request ret
 **An error code is only evidence if a control produces a different one.** Send something that *should* fail differently and confirm it does. Otherwise you're reading tea leaves with a status code.
 
 (Once credits were added, the real call went through first time and the parameters were fine all along. But I didn't *know* that until it did.)
+
+## A third one, from a bug report
+
+I shipped this, and someone ran it in a shell with no credentials:
+
+```
+[escalating to claude-opus-5 — agreement 0.000 below threshold 0.760]
+
+1206
+
+[local fallback · escalation needed ... but unavailable]
+```
+
+The question was *what year was London established*. The correct answer is around AD 47. `1206` is nonsense, and the router **correctly** caught it — agreement 0.000, escalate. That part worked.
+
+But read the output top to bottom. It announces it's escalating to a frontier model, then prints an answer. Anyone would conclude Claude Opus 5 said `1206`. The correction is sitting right there — three lines too late to do any good.
+
+I'd announced the escalation *before* attempting it, so when it failed the announcement just stood there, lending the local model's fabrication the frontier model's authority. Both messages were individually accurate; the sequence was a lie.
+
+The fix is the ordering in the snippet above — retraction first, then the caveat, then the content:
+
+```
+[escalation FAILED — Could not resolve authentication method...]
+
+[showing the LOCAL answer instead — it was judged low confidence, so treat it with suspicion]
+
+1206
+```
+
+Which makes this the third fallback-path bug in this project. First it inflated the metrics; then it misattributed an answer. Both times the happy path was fine and the degraded path — which by construction only runs when something has *already* gone wrong — was where the damage was.
+
+I think that's the actual lesson, and it generalises past this tool: **fallback code runs least, gets tested least, and executes precisely when the user is already having a bad time.** It deserves more scrutiny than the path you actually care about, not less.
 
 ## Tomorrow: the finale
 
