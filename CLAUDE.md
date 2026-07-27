@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A CLI that answers with a local LLM (in-process via Microsoft Foundry Local) and escalates to `claude-opus-5` when the local model is measurably unsure. [README.md](README.md) is comprehensive — it carries the user-facing design doc and developer instructions. This file covers what the README doesn't: the gotchas that required reading `node_modules` install scripts or probing the runtime to establish.
 
-`index.js` is the CLI and routing orchestration; `lib/` holds the local tier, the confidence metric, the frontier tier, metrics, and the calibration set.
+`index.js` is the CLI and routing orchestration; `lib/` holds the local tier (`local.js`), the confidence metric (`confidence.js`), the frontier tier (`frontier.js`), metrics (`metrics.js`), the labelled prompt set (`calibration.js`), and the model-comparison harness (`compare.js`).
 
 ## Commands
 
@@ -59,6 +59,10 @@ First run downloads ~840MB of model weights; later runs hit the cache and start 
 
 **The metric works here partly *because* the model is weak.** A more capable, more self-consistent model agrees with itself even when fabricating, which is why the larger candidates score so badly rather than so well. Do not assume a bigger local model would improve routing — the benchmark says the opposite.
 
+**The local answer cannot stream, and that is deliberate.** All K samples must finish before agreement can be scored, and the routing decision must precede any output — streaming the first sample would commit to a local answer before knowing whether it should escalate. The frontier tier streams because by then the decision is made. Adding streaming to the local path looks like an easy win and silently defeats the router.
+
+**`--compare` is expensive: budget disk and an hour.** Each candidate is downloaded in full (the five-model run pulled roughly 7 GB) and then run through 20 prompts × 3 samples. Weights land in the shared `%USERPROFILE%\.my-app\cache\models` and are never evicted, so benchmarking a wide shortlist is a lasting disk commitment. Probe stochasticity first — a greedy model can be eliminated in three calls, before paying for a full evaluation.
+
 **Frontier tier: `claude-opus-5` — verified end to end.** A real escalation returns content, so the request shape is confirmed accepted: adaptive thinking, streaming, and `fallbacks: "default"` with beta `server-side-fallback-2026-07-01` (note the array form of `fallbacks` uses a *different* header, `-2026-06-01`). Streaming, `usage` accounting, and metrics recording all work against the live API.
 
 **Testing it from this machine needs the WSL token bridge.** `ant` is installed under WSL, not Windows, so its OAuth profile is invisible to the Windows Node process. Pass it explicitly:
@@ -70,6 +74,18 @@ ANTHROPIC_AUTH_TOKEN=$(wsl ant auth print-credentials --access-token | tr -d '\r
 The `tr` matters — WSL emits a trailing CR that corrupts the header. The SDK sets the Bearer header itself; no explicit `oauth-2025-04-20` beta is needed. Tokens are short-lived (~1h), so re-run the substitution rather than caching it.
 
 **A 400 here may say nothing about your request.** The billing check runs *before* body validation: on an account with no credits, a valid body, a bogus beta header, and a `temperature` param that Opus 5 definitively rejects all return the identical `credit balance is too low` error. When debugging a 400, confirm the account has credit before touching the parameters.
+
+## Lessons that cost time
+
+**An error code is only evidence if a control produces a different one.** This bit twice on the frontier tier. A 401 from an invalid key looked like proof the request body was accepted — until a control with a deliberately bogus beta header returned the same 401, showing auth is checked first. Later a 400 looked like a parameter problem, until the same control showed an unfunded account returns that 400 for *any* body. Both times the reasonable-looking inference was worthless. Before concluding anything from a status code, send a request that *should* fail differently and confirm it does.
+
+**Never fold a degraded path into the success bucket.** The metrics counted a failed escalation as local sufficiency, because `entry.escalated` simply stayed `false` when the frontier call threw. That inflates the headline number with precisely the requests that disprove it — the router judged them too hard for the local tier. A fallback fires on the hard cases by construction, so it needs its own outcome (`escalationFailures`, excluded from the rate). Whenever a catch block substitutes a lesser result, ask what it does to the numbers.
+
+**Savings that were never spent are counterfactual — price them from measurement or report `n/a`.** Avoided frontier calls have no measured cost. The estimate prices each at the *measured* mean of escalations that actually completed, and reports `n/a` until at least one has. Do not "improve" this by assuming a token count.
+
+**Optimising a labelled set means sweeping it, not splitting it.** The first threshold picker took the midpoint between class extremes, which is only optimal when the classes separate cleanly. Under overlap it landed on 0.54 and routed 9 of the then-12 prompts correctly; sweeping every candidate value found 0.59 at 11 of 12. When classes overlap, only an explicit sweep over the objective you actually care about finds the optimum.
+
+**Check the harness before believing a surprising ranking.** Larger models scoring dramatically *worse* was the tell that something upstream was broken — and it was: three candidates decode greedily, so their scores measured the runtime rather than the model. A counterintuitive result is a reason to test the instrument, not a finding to report.
 
 ## Conventions
 

@@ -5,6 +5,7 @@ node_modules/
 
 # Benchmark scratch output
 compare-results.txt
+calib-out.txt
 
 # Logs and local env
 *.log

@@ -9,12 +9,13 @@ Every routing decision is recorded, so the value of the local tier is a measurem
 ```console
 $ node index.js "What is the capital of France?"
 Paris
-[local · agreement 1.00 · 676ms · 0 frontier tokens]
+[local · agreement 1.00 · 653ms · 0 frontier tokens]
 
 $ node index.js "Which amendment to the Icelandic fisheries act of 1990 introduced transferable quotas?"
-[escalating to claude-opus-5 — agreement 0.389 below threshold 0.760]
-...
-[frontier · claude-opus-5 · 4.2s · 1,847 tokens]
+[escalating to claude-opus-5 — agreement 0.000 below threshold 0.760]
+**Short answer: none — the premise doesn't hold.** Transferability was not added
+later by amendment; it was built into the Fisheries Management Act itself...
+[frontier · claude-opus-5 · 16003ms · 1503 tokens]
 ```
 
 ---
@@ -200,23 +201,30 @@ The uncomfortable implication is worth stating: this technique works here *becau
 
 ### Calibrating the threshold
 
-The threshold is not a guess. `lib/calibration.js` holds twelve prompts labelled in two classes — `easy` (well within a 0.5B model's competence; *should* stay local) and `hard` (obscure specifics and multi-step reasoning; *should* escalate). `--calibrate` scores every prompt and reports where the classes separate:
+The threshold is not a guess. `lib/calibration.js` holds twenty prompts labelled in two classes — ten `easy` (well within a 0.5B model's competence; *should* stay local) and ten `hard` (obscure specifics and multi-step reasoning; *should* escalate). `--calibrate` scores every prompt and reports where the classes separate:
 
 ```console
 $ node index.js --calibrate
   1.000  easy      What is the chemical symbol for water?
+  0.944  easy      Who wrote the play Romeo and Juliet?
   0.500  easy      Name the largest ocean on Earth.
-  0.500  hard      What was the exact GDP per capita of Botswana in 1987...
+  0.572  hard      A train leaves at 14:23 travelling 87 km/h and anoth...
+  0.470  hard      Derive the stationary distribution of a three-state...
   0.000  hard      Which specific amendment to the Icelandic fisheries...
 
-  easy  n=6  mean 0.917  min 0.500
-  hard  n=6  mean 0.374  max 0.587
+  easy  n=10  mean 0.944  min 0.500
+  hard  n=10  mean 0.332  max 0.587
 
   separation gap -0.087
-  best threshold 0.59 — 11/12 correctly routed
+  classes overlap — no threshold separates them perfectly on this set.
+  best threshold 0.59 — 19/20 correctly routed
     1 easy escalated unnecessarily (costs tokens)
     0 hard kept local (risks a confident wrong answer)
 ```
+
+The two classes separate cleanly in the mean — **0.944 easy against 0.332 hard** — which is the signal the router runs on.
+
+`--calibrate` and `--compare` optimise different objectives and will disagree, which is intended. `--calibrate` scores against the *labels* (did an `easy` prompt stay local?) and suggests 0.59. `--compare` scores against *correctness* (was the answer kept local actually right?) and suggests 0.76. **`--compare` is authoritative**, because a label only asserts a prompt *should* be answerable, whereas correctness checks whether this model actually answered it.
 
 The threshold is found by **sweeping** candidate values and counting misclassifications, not by taking the midpoint between the classes — midpoint is only optimal when they separate cleanly, and here they overlap.
 
@@ -252,13 +260,17 @@ Cumulative counters persist to `%USERPROFILE%\.my-app\router-metrics.json`.
 
 ```console
 $ node index.js --stats
-  Requests                3
-  Answered locally        2  (100.0%)
-  Escalated               0
-  Escalations failed      1  (excluded from rate)
+  Requests                5
+  Answered locally        4  (80.0%)
+  Escalated               1
 
-  Local tokens            600  (free, on-device)
-  Frontier tokens spent   0  (0 in / 0 out)
+  Local tokens            1,021  (free, on-device)
+  Frontier tokens spent   1,503  (457 in / 1,046 out)
+  Frontier tokens avoided ~6,012  (est. from measured mean)
+
+  Mean local latency      3.1s
+  Mean frontier latency   16.0s
+  Latency avoided         ~64.0s  (est. from measured mean)
 ```
 
 Two properties are worth stating plainly, because savings figures invite overclaiming:
@@ -279,21 +291,26 @@ No build step. Edit and re-run.
 foundry-first/
 ├── index.js              # CLI, routing orchestration, calibration harness
 ├── lib/
-│   ├── local.js          # Local sampling, model lifecycle, medoid selection
+│   ├── local.js          # Local sampling, model lifecycle, <think> stripping
 │   ├── confidence.js     # Agreement metric and escalation policy
 │   ├── frontier.js       # Anthropic escalation
 │   ├── metrics.js        # Persistent counters
-│   └── calibration.js    # Labelled prompt set
+│   ├── calibration.js    # Labelled prompt set with expected answers
+│   └── compare.js        # Model benchmark: stochasticity probe, threshold sweep
 └── LICENSE               # GPL-3.0
 ```
 
 **Tune the routing.** All knobs live in the `CONFIG` object at the top of [`index.js`](index.js): model alias, sample count, temperature, threshold, token limits, and the local system prompt. `--samples` and `--threshold` override the last two per-run.
 
-**Trade cost against sensitivity.** Confidence costs K local inferences per question — the price of an objective metric when logprobs are unavailable. Raising `--samples` sharpens the estimate and slows every request; lowering it to 2 is the cheapest measurement possible, since one sample has nothing to compare against.
+**Trade cost against sensitivity.** Confidence costs K local inferences per question — the price of an objective metric when logprobs are unavailable. Raising `--samples` sharpens the estimate and slows every request; lowering it to 2 is the cheapest measurement possible, since one sample has nothing to compare against. Changing K changes the threshold, so re-run `--compare` after.
 
-**Swap the local model.** Change `modelAlias` in `CONFIG`, then **re-run `--calibrate`** — a different model has a different separation point, and the inherited threshold will be wrong.
+**Swap the local model.** Run `--compare old,new` before committing to one, and change `modelAlias` in `CONFIG` only if the new model is flagged usable. Two things will bite otherwise: most catalog models decode greedily, which makes the router silently stop escalating, and the threshold is a property of the model, so an inherited one will be wrong.
 
-**Change the confidence metric.** [`lib/confidence.js`](lib/confidence.js) is self-contained: `scoreSamples` produces the score, `shouldEscalate` applies the policy. If a future SDK release populates `logprobs`, mean log-probability drops in as a replacement for `scoreSamples` with nothing else changing.
+Budget for it — every candidate is downloaded in full (the five-model run pulled ~7 GB into the shared cache, never evicted) and then run through 20 prompts × 3 samples. A greedy model can be ruled out in three calls, so probe before paying for a full evaluation.
+
+**Change the confidence metric.** [`lib/confidence.js`](lib/confidence.js) is self-contained: `scoreSamples` produces the score, `shouldEscalate` applies the policy. If a future SDK release populates `logprobs`, mean log-probability drops in as a replacement for `scoreSamples` with nothing else changing — and would remove the stochasticity requirement, since logprobs are readable from a single greedy sample.
+
+**Do not add streaming to the local answer.** It looks like free responsiveness and silently defeats the router: all K samples must complete before agreement can be scored, and the routing decision has to precede any output. Streaming the first sample commits to a local answer before knowing whether it should escalate. The frontier tier streams because by then the decision is already made.
 
 **Inspect a routing decision.** `--verbose` prints each draft with its finish reason and the resulting score:
 
@@ -331,9 +348,23 @@ npm install
 
 A correct Windows x64 install has five DLLs under `foundry-local-core/win32-x64/`: `Microsoft.AI.Foundry.Local.Core.dll`, `Microsoft.Windows.AI.MachineLearning.dll`, `onnxruntime.dll`, `onnxruntime-genai.dll`, and `onnxruntime_providers_shared.dll`.
 
-**Everything escalates / nothing escalates**
+**Nothing ever escalates**
 
-The threshold is calibrated for Qwen2.5-0.5B at temperature 0.7 with 3 samples. Change any of those and re-run `--calibrate`.
+Most likely the local model decodes greedily, making every sample identical and agreement a constant 1.0. Check with `--compare <alias>`, which probes for this before scoring and prints:
+
+```
+⚠ decodes greedily — ignores temperature, so self-consistency cannot measure it
+```
+
+There is no fix — the technique cannot be used with such a model. Pick one the probe reports as usable. The same symptom appears if `temperature` is set to 0.
+
+**Everything escalates**
+
+The threshold is calibrated for Qwen2.5-0.5B at temperature 0.7 with 3 samples. Change any of those and re-run `--compare`.
+
+**`400 … credit balance is too low`**
+
+Exactly what it says — but note it is returned for *any* request body on an unfunded account, including invalid ones. The billing check runs before body validation, so this error tells you nothing about your parameters. Add credit before debugging the request.
 
 **The import and the dependency have different names**
 
