@@ -21,16 +21,26 @@ import { scoreSamples, shouldEscalate } from './lib/confidence.js';
 import { escalate, credentialHint, FRONTIER_MODEL } from './lib/frontier.js';
 import * as metrics from './lib/metrics.js';
 import { CALIBRATION_SET } from './lib/calibration.js';
+import { compareModels, formatComparison } from './lib/compare.js';
 
 const CONFIG = {
     appName: 'my-app',
+    // Benchmarked against qwen3-0.6b, qwen3.5-0.8b, qwen2.5-1.5b and
+    // phi-3.5-mini via `--compare`. It wins for a non-obvious reason: most
+    // catalog models decode greedily under Foundry Local regardless of
+    // temperature, which makes every sample identical and self-consistency
+    // unusable. See the Choosing the local model section of README.md.
     modelAlias: 'qwen2.5-0.5b',
     sampleCount: 3,
     // Must be non-zero. At temperature 0 the model is deterministic, every
     // sample is identical, and agreement is a constant 1.0 that measures
     // nothing. See lib/confidence.js.
     temperature: 0.7,
-    localMaxTokens: 512,
+    // Generous because reasoning models (qwen3, phi-4-reasoning) spend most of
+    // their budget inside <think> before writing a word of the answer. Too low
+    // a cap truncates them mid-thought, which the scorer correctly disqualifies
+    // — but that would measure the cap, not the model.
+    localMaxTokens: 1024,
     // Load-bearing for the metric, not a style preference. Left unconstrained,
     // this model wraps a stable answer in unstable prose — three samples all
     // saying "H2O" scored 0.307 because the surrounding explanation differed
@@ -40,17 +50,17 @@ const CONFIG = {
         'Answer directly and concisely. State only the answer itself. '
         + 'Do not explain your reasoning, restate the question, or add caveats unless explicitly asked.',
     frontierMaxTokens: 64000,
-    // Calibrated, not chosen: `--calibrate` sweeps thresholds against a
-    // labelled easy/hard set and reports the best cut. 0.59 routes 11/12
-    // correctly; rounded up to 0.60 because the two error types differ in cost
-    // — an unnecessary escalation spends tokens, a hard question kept local
-    // presents a fabrication as fact. Re-run --calibrate after changing the
-    // model, sample count, or temperature.
-    threshold: 0.60,
+    // Measured, not chosen. `--compare` sweeps thresholds against the labelled
+    // set scoring *correctness*, minimising wrong answers kept local before
+    // maximising right ones, and takes the midpoint of the widest viable band
+    // so the cut survives run-to-run noise. On qwen2.5-0.5b that is 0.76:
+    // 9/20 answered locally and correctly, 0 wrong answers kept local.
+    // Re-run --compare after changing the model, sample count, or temperature.
+    threshold: 0.76,
 };
 
 function parseArgs(argv) {
-    const opts = { prompt: [], stats: false, calibrate: false, resetStats: false, localOnly: false, verbose: false };
+    const opts = { prompt: [], stats: false, calibrate: false, resetStats: false, localOnly: false, verbose: false, compare: null };
     for (let i = 0; i < argv.length; i += 1) {
         const arg = argv[i];
         switch (arg) {
@@ -61,6 +71,8 @@ function parseArgs(argv) {
             case '--verbose': case '-v': opts.verbose = true; break;
             case '--threshold': CONFIG.threshold = Number(argv[++i]); break;
             case '--samples': CONFIG.sampleCount = Number(argv[++i]); break;
+            case '--model': CONFIG.modelAlias = argv[++i]; break;
+            case '--compare': opts.compare = (argv[++i] ?? '').split(',').filter(Boolean); break;
             default: opts.prompt.push(arg);
         }
     }
@@ -79,9 +91,11 @@ Options:
   --samples <n>       Samples drawn to measure agreement (default ${CONFIG.sampleCount})
   --threshold <0-1>   Agreement below this escalates (default ${CONFIG.threshold})
   --verbose, -v       Show per-sample drafts and the agreement score
+  --model <alias>     Local model to use (default ${CONFIG.modelAlias})
   --stats             Print cumulative routing metrics and exit
   --reset-stats       Clear cumulative metrics and exit
-  --calibrate         Measure agreement across a labelled prompt set and exit`;
+  --calibrate         Measure agreement across a labelled prompt set and exit
+  --compare a,b,c     Benchmark candidate local models against that set and exit`;
 
 function log(verbose, message) {
     if (verbose) {
@@ -158,6 +172,14 @@ async function main() {
     if (opts.stats) {
         console.log(metrics.format(metrics.summarize(metrics.load(CONFIG.appName))));
         console.log(`\n  ${metrics.metricsPath(CONFIG.appName)}`);
+        return;
+    }
+
+    // Comparison loads each candidate itself, so it runs before the single
+    // model below is resolved.
+    if (opts.compare) {
+        const results = await compareModels(opts.compare, CONFIG, CONFIG.appName);
+        console.log(formatComparison(results));
         return;
     }
 

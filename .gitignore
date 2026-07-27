@@ -3,6 +3,9 @@ node_modules/
 # Claude Code machine-local permission settings
 .claude/settings.local.json
 
+# Benchmark scratch output
+compare-results.txt
+
 # Logs and local env
 *.log
 npm-debug.log*

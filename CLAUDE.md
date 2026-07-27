@@ -14,9 +14,12 @@ A CLI that answers with a local LLM (in-process via Microsoft Foundry Local) and
 npm install                      # fetches ~46MB of native libs via install scripts
 node index.js "<prompt>"         # run
 node index.js --calibrate        # re-measure the confidence threshold
+node index.js --compare a,b,c    # benchmark candidate local models (slow: downloads + 3 samples × 20 prompts each)
 node index.js --stats            # cumulative routing metrics
 node index.js -v --local-only "…" # inspect a routing decision without escalating
 ```
+
+`foundry model list` shows the full catalog of local candidates. Filter the ANSI codes (`sed 's/\x1b\[[0-9;]*m//g'`) or the table is unreadable.
 
 There is **no build step, no linter, and no test suite**. `npm test` is npm's default placeholder and exits 1 by design. Verification means running the binary with a real prompt and reading the output — a change that "looks right" is not verified until inference actually completes. `--local-only` makes that cheap: it exercises the whole local path and the routing decision without needing credentials or spending frontier tokens.
 
@@ -42,11 +45,25 @@ First run downloads ~840MB of model weights; later runs hit the cache and start 
 
 **Temperature must stay non-zero.** At temperature 0 the model is deterministic, every sample is identical, agreement is a constant 1.0, and the confidence signal silently carries no information. Nothing errors — the router just stops escalating.
 
+**Most catalog models decode greedily and ignore temperature entirely — check before adopting one.** This is the single biggest constraint on model choice, and it is invisible until probed. Measured with `probeStochasticity()`: `qwen2.5-1.5b`, `qwen3.5-0.8b`, and `phi-3.5-mini` all return byte-identical text across samples at temperature 1.5 with top-p 0.95 and no seed; `qwen2.5-0.5b` and `qwen3-0.6b` vary 3/3. For a greedy model the failure is exactly the temperature-0 case above, and it is silent: agreement pins at 1.0, nothing escalates, and the local tier starts presenting fabrications as fact. `--compare` probes this first and flags such models `⚠`, ranking them last regardless of score, because their rows describe the runtime's decoding rather than the model. Never adopt a new local model without running that probe.
+
 **The local system prompt is load-bearing for the metric, not cosmetic.** Suppressing explanation is what makes agreement measure the answer rather than the phrasing; removing it moved mean agreement on known-easy prompts from 0.941 back down to 0.601 and destroyed class separation. Same for the numeric-agreement rule in `pairAgreement` — without it, confidently-hallucinated figures score 0.778 on shared prose.
 
-**The threshold is calibrated, not chosen.** `--calibrate` scores a labelled easy/hard set and reports the separating point. Re-run it after changing the model, sample count, or temperature — the separation point is a property of the model. The classes currently overlap slightly (gap −0.087); that is a reported finding, not a bug to tune away.
+**Reasoning models emit `<think>` inline and it must be stripped.** The qwen3 and qwen3.5 families, `phi-4-reasoning`, and `deepseek-r1` return their chain of thought as `<think>…</think>` before the answer, in the same `content` string. `stripThinking()` in `lib/local.js` removes it before scoring and before display. Without it the reasoning prose — long, free-form, and far more variable between samples than the answer — swamps the agreement signal exactly as unconstrained prose did, so reasoning models would be penalised for reasoning. Their think block also consumes most of `localMaxTokens`, which is why it is set to 1024: a lower cap truncates them mid-thought, and the scorer then correctly disqualifies a sample that only the cap broke.
 
-**Frontier tier: `claude-opus-5`, and the request shape is unverified.** No Anthropic credentials were available when the escalation path was written, so it has never completed a real call. It is known to construct and transmit — an invalid key returns 401 from the API — but a control test confirmed auth is checked *before* body validation, so that 401 proves nothing about whether the parameters are accepted. The first real call may surface a 400. Parameters follow the `claude-api` skill: adaptive thinking, streaming, and `fallbacks: "default"` with beta `server-side-fallback-2026-07-01` (note the array form of `fallbacks` uses a *different* header, `-2026-06-01`).
+**Model choice is a `--compare` measurement, not a preference.** `lib/compare.js` runs the labelled set against each candidate and ranks by joint outcome — fewest wrong answers kept local first, then most correct answers kept local. Agreement alone cannot rank models: it measures conviction, and a model reliably wrong in the same way scores perfectly. That is why `CALIBRATION_SET` carries `expect` strings, including on the computable `hard` prompts so a model that genuinely solves one is credited rather than punished.
+
+**The threshold sweep takes the midpoint of the widest viable band, not the lowest working value.** Agreement varies between runs — one prompt measured 0.587 during calibration and 0.554 in normal use — so a threshold sitting flush against the nearest wrong answer does not survive that noise.
+
+**The threshold is calibrated, not chosen.** `--compare` sweeps it against the labelled set scoring correctness; the current 0.76 comes from that run on `qwen2.5-0.5b` (9/20 local-correct, 0 local-wrong). Re-run after changing the model, sample count, or temperature — it is a property of the model. `--calibrate` is the older agreement-only view and still reports a class-separation gap of −0.087; the overlap is a reported finding, not a bug to tune away.
+
+**The metric works here partly *because* the model is weak.** A more capable, more self-consistent model agrees with itself even when fabricating, which is why the larger candidates score so badly rather than so well. Do not assume a bigger local model would improve routing — the benchmark says the opposite.
+
+**Frontier tier: `claude-opus-5`, and the request shape is still unverified.** Parameters follow the `claude-api` skill: adaptive thinking, streaming, and `fallbacks: "default"` with beta `server-side-fallback-2026-07-01` (note the array form of `fallbacks` uses a *different* header, `-2026-06-01`).
+
+Authentication works — `ant` is installed under WSL, and its OAuth token reaches the Windows process via `ANTHROPIC_AUTH_TOKEN=$(wsl ant auth print-credentials --access-token)`. The SDK accepts it and sets the Bearer header itself; no explicit `oauth-2025-04-20` beta was needed.
+
+What blocks verification is billing, not auth: the account returns `400 … credit balance is too low`. A four-way control — valid body, bogus beta header, and a `temperature` param that Opus 5 definitively rejects — returned that *same* error for every case, proving the credit check runs **before** body validation. So no request has ever been validated, and the first call on a funded account may still surface a parameter 400. Do not record this path as working until a real call returns content.
 
 ## Conventions
 

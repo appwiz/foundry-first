@@ -12,7 +12,7 @@ Paris
 [local · agreement 1.00 · 676ms · 0 frontier tokens]
 
 $ node index.js "Which amendment to the Icelandic fisheries act of 1990 introduced transferable quotas?"
-[escalating to claude-opus-5 — agreement 0.389 below threshold 0.600]
+[escalating to claude-opus-5 — agreement 0.389 below threshold 0.760]
 ...
 [frontier · claude-opus-5 · 4.2s · 1,847 tokens]
 ```
@@ -26,6 +26,8 @@ $ node index.js "Which amendment to the Icelandic fisheries act of 1990 introduc
 - [Design](#design)
   - [Why route at all](#why-route-at-all)
   - [The confidence signal](#the-confidence-signal)
+  - [Reasoning models hide their answer](#reasoning-models-hide-their-answer)
+  - [Choosing the local model](#choosing-the-local-model)
   - [Calibrating the threshold](#calibrating-the-threshold)
   - [What the metric cannot see](#what-the-metric-cannot-see)
   - [Escalation](#escalation)
@@ -68,11 +70,13 @@ export ANTHROPIC_API_KEY=sk-ant-...   # or: ant auth login
 ```
 --local-only        Never escalate; report what would have happened
 --samples <n>       Samples drawn to measure agreement (default 3)
---threshold <0-1>   Agreement below this escalates (default 0.60)
+--threshold <0-1>   Agreement below this escalates
+--model <alias>     Local model to use
 --verbose, -v       Show per-sample drafts and the agreement score
 --stats             Print cumulative routing metrics
 --reset-stats       Clear cumulative metrics
 --calibrate         Measure agreement across a labelled prompt set
+--compare a,b,c     Benchmark candidate local models against that set
 ```
 
 ---
@@ -113,6 +117,81 @@ Two objective facts about the generation bypass the score entirely and force esc
 - **`finish_reason === 'length'`** — the sample was cut off mid-answer, so agreement between fragments proves nothing.
 - **A sample with no content words** — nothing to agree about.
 
+### Reasoning models hide their answer
+
+The qwen3 and qwen3.5 families, `phi-4-reasoning`, and `deepseek-r1` return their chain of thought inline, in the same string as the answer:
+
+```
+<think>
+Okay, the user is asking for the capital of France. Let me recall... I should
+double-check that this is correct. Since I'm a language model, I don't have the
+ability to verify information, but I know that the capital of France is Paris.
+</think>
+
+Paris.
+```
+
+That reasoning is stripped before scoring and before display. It has to be: it is long, free-form, and varies far more between samples than the answer does, so leaving it in would swamp the agreement signal in exactly the way unconstrained prose did — **penalising a reasoning model for reasoning**. It also consumes most of the token budget before the answer starts, which is why the local cap is 1024 rather than 512; a lower cap truncates these models mid-thought, and the scorer then correctly disqualifies a sample that only the cap broke.
+
+### Choosing the local model
+
+Foundry Local's catalog runs from 0.5B to 20B parameters (`foundry model list`), so the default is a measurement rather than a preference. `--compare` runs the labelled set against each candidate:
+
+```bash
+node index.js --compare qwen2.5-0.5b,qwen3-0.6b,qwen3.5-0.8b,qwen2.5-1.5b,phi-3.5-mini
+```
+
+**Agreement alone cannot rank models.** It measures conviction, and a model reliably wrong in the same way scores a perfect 1.0. Ranking on it would select for confident wrongness. So every calibration prompt carries `expect` — accepted forms of the right answer — and candidates are judged on the joint outcome:
+
+| Outcome | Meaning |
+|---|---|
+| **local-ok** | Kept local **and** right. The entire point of the local tier. |
+| **local-BAD** | Kept local **and** wrong. The failure that matters — a fabrication presented as fact. |
+| **escalated** | Sent to the frontier tier. Costs tokens, never wrong. |
+
+Both the threshold sweep and the model ranking minimise **local-BAD** first and maximise **local-ok** only as a tie-break, encoding the asymmetry directly: an unnecessary escalation spends tokens, a wrong local answer misinforms.
+
+The computable `hard` prompts carry `expect` too — worked out by hand — so a model that genuinely *solves* one is credited for answering locally rather than punished by an assumption that small models always fail. The remaining hard prompts are unknowable trivia where keeping the answer local is an error by definition.
+
+#### Most models in the catalog cannot be used at all
+
+Before scoring anything, `--compare` probes whether the runtime actually **samples**. This turns out to be the decisive criterion:
+
+| model | distinct samples | usable |
+|---|---|---|
+| `qwen2.5-0.5b` | 3/3 | ✅ |
+| `qwen3-0.6b` | 3/3 | ✅ |
+| `qwen3.5-0.8b` | 1/3 | ❌ greedy |
+| `qwen2.5-1.5b` | 1/3 | ❌ greedy |
+| `phi-3.5-mini` | 1/3 | ❌ greedy |
+
+Three of the five return **byte-identical text on every sample** — at temperature 1.5, with top-p 0.95, and with no seed set. Foundry Local decodes them greedily and ignores the temperature setting entirely:
+
+```console
+$ node index.js --compare qwen2.5-1.5b
+  ⚠ decodes greedily — ignores temperature, so self-consistency cannot measure it
+  [1] $2065.43     [2] $2065.43     [3] $2065.43
+```
+
+For those models agreement is a constant 1.0, nothing ever clears the escalation bar, and **the router silently degrades into "always answer locally"** — the failure documented for temperature 0, occurring here at temperature 0.7 through no fault of the configuration. It is silent because nothing errors: the local tier just quietly starts presenting fabrications as fact.
+
+This is what actually produced their terrible scores in the table below. Their `local-BAD` columns measure the runtime's decoding, not the model's judgement, so they are ranked last regardless of score and flagged `⚠`.
+
+#### Results
+
+```
+  model              easy   hard    gap  thresh   local-ok  local-BAD  escalated   latency  tokens
+  qwen2.5-0.5b       0.94   0.29  -0.09   0.76        9/20         0         11     16.2s     567
+  qwen3-0.6b         0.97   0.24  -0.33   0.65        9/20         2          9     41.0s    1316
+  phi-3.5-mini  ⚠    1.00   0.90  + 0.00   0.50       11/20         8          1     66.0s     555
+  qwen3.5-0.8b  ⚠    1.00   0.90  + 0.00   0.50       10/20         9          1     12.5s     519
+  qwen2.5-1.5b  ⚠    1.00   1.00  + 0.00   0.50        9/20        11          0      5.7s     280
+```
+
+Between the two usable candidates, **`qwen2.5-0.5b` at threshold 0.76** wins on every axis: the same 9/20 answered locally and correctly, but **zero** wrong answers kept local against qwen3-0.6b's two, at 2.5× the speed and 2.3× fewer tokens (qwen3-0.6b spends most of its budget inside `<think>`).
+
+The uncomfortable implication is worth stating: this technique works here *because* the model is weak enough to be erratic. A more capable, more self-consistent model agrees with itself even when fabricating, and the signal degrades. Self-consistency is a confidence measure for models that are genuinely uncertain — not a general-purpose correctness oracle.
+
 ### Calibrating the threshold
 
 The threshold is not a guess. `lib/calibration.js` holds twelve prompts labelled in two classes — `easy` (well within a 0.5B model's competence; *should* stay local) and `hard` (obscure specifics and multi-step reasoning; *should* escalate). `--calibrate` scores every prompt and reports where the classes separate:
@@ -135,9 +214,11 @@ $ node index.js --calibrate
 
 The threshold is found by **sweeping** candidate values and counting misclassifications, not by taking the midpoint between the classes — midpoint is only optimal when they separate cleanly, and here they overlap.
 
-The default **0.60** rounds the measured 0.59 up, because the two error types are not equally bad. An unnecessary escalation costs tokens; a hard question kept local presents a fabrication as fact. At 0.60 no hard prompt in the set stays local.
+The sweep also takes the **midpoint of the widest viable band** rather than the lowest value that happens to work. Agreement varies between runs — one prompt measured 0.587 during calibration and 0.554 in normal use — so a threshold sitting flush against the nearest wrong answer does not survive that noise.
 
-Re-run `--calibrate` after changing the model, the sample count, or the temperature. The separation point is a property of *the model*, not of the metric.
+The default **0.76** is the value `--compare` produces for `qwen2.5-0.5b` scoring against correctness: 9/20 answered locally and correctly, with zero wrong answers kept local.
+
+Re-run `--compare` after changing the model, the sample count, or the temperature. The separation point is a property of *the model*, not of the metric.
 
 ### What the metric cannot see
 
@@ -213,7 +294,7 @@ $ node index.js -v --local-only "Name the largest ocean on Earth."
   [draft 1] (stop) The largest ocean by area is the Pacific Ocean, which has an estimated 196,087,534 km².
   [draft 2] (stop) The largest ocean by area is the Pacific Ocean, which has an area of approximately 148,000 square kilometers.
   [draft 3] (stop) The largest ocean on Earth is the Pacific Ocean.
-  agreement 0.500 vs threshold 0.6 — ESCALATE
+  agreement 0.500 vs threshold 0.76 — ESCALATE
 ```
 
 ### Where things live on disk
