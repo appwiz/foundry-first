@@ -71,7 +71,11 @@ First run downloads ~840MB of model weights; later runs hit the cache and start 
 ANTHROPIC_AUTH_TOKEN=$(wsl ant auth print-credentials --access-token | tr -d '\r\n') node index.js "…"
 ```
 
-The `tr` matters — WSL emits a trailing CR that corrupts the header. The SDK sets the Bearer header itself; no explicit `oauth-2025-04-20` beta is needed. Tokens are short-lived (~1h), so re-run the substitution rather than caching it.
+```powershell
+$env:ANTHROPIC_AUTH_TOKEN = (wsl ant auth print-credentials --access-token).Trim()
+```
+
+Stripping whitespace matters — WSL emits a trailing CR that corrupts the header. The variable is per-shell, so a new terminal needs it again. The SDK sets the Bearer header itself; no explicit `oauth-2025-04-20` beta is needed. Tokens are short-lived (~1h), so re-run the substitution rather than caching it.
 
 **A 400 here may say nothing about your request.** The billing check runs *before* body validation: on an account with no credits, a valid body, a bogus beta header, and a `temperature` param that Opus 5 definitively rejects all return the identical `credit balance is too low` error. When debugging a 400, confirm the account has credit before touching the parameters.
 

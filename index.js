@@ -229,12 +229,16 @@ async function main() {
                 entry = await runEscalation(opts, samples, decision, entry);
             } catch (err) {
                 entry.escalationFailed = true;
-                console.log(selectRepresentative(samples).text.trim());
-                console.error(`\n[local fallback · escalation needed (${decision.reason}) but unavailable]`);
-                console.error(`  ${err.message.split('\n')[0]}`);
+                // Retract the escalation notice *before* printing anything, or
+                // the local draft appears directly beneath "escalating to
+                // claude-opus-5" and reads as though the frontier model
+                // produced it. The correction has to precede the content.
+                console.error(`[escalation FAILED — ${err.message.split('\n')[0]}]`);
                 if (!credentialHint()) {
-                    console.error('  Set ANTHROPIC_API_KEY, or run `ant auth login`, to enable the frontier tier.');
+                    console.error('  Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN, or run `ant auth login`.');
                 }
+                console.error('\n[showing the LOCAL answer instead — it was judged low confidence, so treat it with suspicion]\n');
+                console.log(selectRepresentative(samples).text.trim());
             }
         }
 

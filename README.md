@@ -68,9 +68,17 @@ export ANTHROPIC_API_KEY=sk-ant-...   # or: ant auth login
 
 If `ant` is installed under WSL rather than Windows, its profile is invisible to the Windows process — bridge the token across, stripping the trailing CR that would otherwise corrupt the header:
 
+```powershell
+# PowerShell
+$env:ANTHROPIC_AUTH_TOKEN = (wsl ant auth print-credentials --access-token).Trim()
+```
+
 ```bash
+# bash / git-bash
 export ANTHROPIC_AUTH_TOKEN=$(wsl ant auth print-credentials --access-token | tr -d '\r\n')
 ```
+
+Tokens last about an hour, and the variable only lives for that shell session — re-run it in each new terminal.
 
 ### Options
 
