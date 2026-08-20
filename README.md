@@ -98,6 +98,15 @@ Tokens last about an hour, and the variable only lives for that shell session �
 
 ## Design
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/call-path-dark.svg">
+    <img alt="Call path for one prompt: three seeded local samples are scored for agreement, and a threshold gate sends the question either to a local answer or to claude-opus-5 with the drafts attached as context." src="docs/call-path-light.svg" width="100%">
+  </picture>
+</p>
+
+<p align="center"><sub><b>The call path for a single prompt.</b> Green is the free path, amber the paid one. The gate closes before anything is printed — which is why the local tier cannot stream.</sub></p>
+
 ### Why route at all
 
 A 0.5B-parameter model runs on any laptop CPU, costs nothing per token, and never sends a keystroke off the machine. It is also wrong a great deal of the time. A frontier model inverts every one of those properties.
@@ -320,6 +329,7 @@ foundry-first/
 │   ├── metrics.js        # Persistent counters
 │   ├── calibration.js    # Labelled prompt set with expected answers
 │   └── compare.js        # Model benchmark: stochasticity probe, threshold sweep
+├── docs/                 # Call-path diagram: light and dark variants, kept in sync
 └── LICENSE               # GPL-3.0
 ```
 

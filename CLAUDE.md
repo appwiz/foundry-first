@@ -97,6 +97,10 @@ Stripping whitespace matters — WSL emits a trailing CR that corrupts the heade
 
 - Source files carry a GPL-3.0-or-later notice header. Keep `package.json`, `package-lock.json`, per-file headers, and `LICENSE` consistent when adding files.
 - ESM with top-level `await` (`"type": "module"`). 4-space indent.
+- **The two call-path SVGs are a generated pair, not two drawings.** `docs/call-path-light.svg` is the source; `docs/call-path-dark.svg` is `sed 's/color="#1f2328"/color="#e6edf3"/'` over it and must be regenerated after any edit (`diff` them — one line should differ). GitHub markdown strips inline `<svg>`, so the README references them through a `<picture>` element, which is also why `currentColor` cannot inherit from the page: the root `<svg color=…>` attribute supplies it instead. All *text* is `currentColor` so it stays legible on both grounds; the green and amber accents are confined to strokes, where a 3:1 contrast ratio is enough. Verify a change by rendering rather than by reading the XML:
+  ```bash
+  msedge --headless=new --screenshot=out.png --window-size=960,380 file:///…/preview.html
+  ```
 
 ## Known constraints
 
