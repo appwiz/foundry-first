@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { loadLocalModel, sampleLocal, selectRepresentative } from './lib/local.js';
+import { loadLocalModel, sampleLocal, selectRepresentative, completedSamples } from './lib/local.js';
 import { scoreSamples, shouldEscalate } from './lib/confidence.js';
 import { escalate, credentialHint, FRONTIER_MODEL } from './lib/frontier.js';
 import * as metrics from './lib/metrics.js';
@@ -207,29 +207,44 @@ async function main() {
         const { samples, latencyMs, localTokens } = await sampleLocal(model, opts.prompt, CONFIG);
         const score = scoreSamples(samples);
         const decision = shouldEscalate(score, CONFIG.threshold);
+        // A failed sample (the runtime's 120s cap, or a model it cannot run)
+        // forces escalation through the scorer. Only completed drafts are
+        // shown or passed on; there may be none at all.
+        const failure = samples.find((s) => s.finishReason === 'error');
+        const drafts = completedSamples(samples);
+
+        if (failure) {
+            console.error(`[local model failed — ${failure.error}]`);
+        }
 
         if (opts.verbose) {
             samples.forEach((s, i) => {
-                log(true, `  [draft ${i + 1}] (${s.finishReason}) ${s.text.trim().replace(/\s+/g, ' ').slice(0, 110)}`);
+                const body = s.finishReason === 'error' ? s.error : s.text.trim().replace(/\s+/g, ' ').slice(0, 110);
+                log(true, `  [draft ${i + 1}] (${s.finishReason}) ${body}`);
             });
             log(true, `  agreement ${score.agreement.toFixed(3)} vs threshold ${CONFIG.threshold} — ${decision.escalate ? 'ESCALATE' : 'LOCAL'}\n`);
         }
 
-        let entry = { localTokens, localLatencyMs: latencyMs, escalated: false };
+        let entry = { localTokens, localLatencyMs: latencyMs, escalated: false, localFailed: Boolean(failure) };
 
         if (!decision.escalate) {
-            console.log(selectRepresentative(samples).text.trim());
+            console.log(selectRepresentative(drafts).text.trim());
             console.error(`\n[local · agreement ${score.agreement.toFixed(2)} · ${latencyMs}ms · 0 frontier tokens]`);
         } else if (opts.localOnly) {
-            console.log(selectRepresentative(samples).text.trim());
-            console.error(`\n[local-only · would have escalated: ${decision.reason}]`);
+            if (drafts.length > 0) {
+                console.log(selectRepresentative(drafts).text.trim());
+                console.error(`\n[local-only · would have escalated: ${decision.reason}]`);
+            } else {
+                console.error(`\n[local-only · no local answer: ${decision.reason}]`);
+                process.exitCode = 1;
+            }
         } else {
             // The frontier tier can fail for reasons outside our control —
             // absent credentials, network, rate limits. None of those should
             // cost the user the answer we already have in hand, so degrade to
             // the local draft rather than exiting empty-handed.
             try {
-                entry = await runEscalation(opts, samples, decision, entry);
+                entry = await runEscalation(opts, drafts, decision, entry);
             } catch (err) {
                 entry.escalationFailed = true;
                 // Retract the escalation notice *before* printing anything, or
@@ -240,8 +255,18 @@ async function main() {
                 if (!credentialHint()) {
                     console.error('  Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN, or run `ant auth login`.');
                 }
-                console.error('\n[showing the LOCAL answer instead — it was judged low confidence, so treat it with suspicion]\n');
-                console.log(selectRepresentative(samples).text.trim());
+                if (drafts.length === 0) {
+                    // Neither tier produced anything. Say so, and fail the
+                    // process, rather than print an empty answer.
+                    console.error('\n[no answer — the local model failed too, so there is nothing to fall back on]');
+                    process.exitCode = 1;
+                } else if (failure) {
+                    console.error('\n[showing a LOCAL draft instead — another local sample failed, so its confidence was never measured; treat it with suspicion]\n');
+                    console.log(selectRepresentative(drafts).text.trim());
+                } else {
+                    console.error('\n[showing the LOCAL answer instead — it was judged low confidence, so treat it with suspicion]\n');
+                    console.log(selectRepresentative(drafts).text.trim());
+                }
             }
         }
 
@@ -252,9 +277,9 @@ async function main() {
     }
 }
 
-async function runEscalation(opts, samples, decision, entry) {
+async function runEscalation(opts, drafts, decision, entry) {
     console.error(`[escalating to ${FRONTIER_MODEL} — ${decision.reason}]\n`);
-    const result = await escalate(opts.prompt, samples, decision.reason, {
+    const result = await escalate(opts.prompt, drafts, decision.reason, {
         onText: (delta) => process.stdout.write(delta),
         maxTokens: CONFIG.frontierMaxTokens,
     });

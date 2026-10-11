@@ -135,6 +135,7 @@ Two objective facts about the generation bypass the score entirely and force esc
 
 - **`finish_reason === 'length'`** — the sample was cut off mid-answer, so agreement between fragments proves nothing.
 - **A sample with no content words** — nothing to agree about.
+- **A sample the runtime failed to produce** — the native core's 120-second completion cap, or a model it cannot execute. Sampling stops at the first failure, since each further attempt would likely fail the same way at up to 120 seconds apiece.
 
 ### Reasoning models hide their answer
 
@@ -303,6 +304,8 @@ The reuse is not cosmetic. Asked which amendment introduced Iceland's transferab
 
 Escalation failure — absent credentials, network, rate limits — never costs the user an answer. The local draft is printed instead, and the request is recorded as a failed escalation rather than a local success.
 
+The local tier can fail too: the runtime cancels any completion at 120 seconds. A failed sample forces escalation like any other disqualifier, and only the drafts that completed ride along. When neither tier produces anything, the CLI reports `[no answer — the local model failed too …]` and exits 1, rather than printing an empty answer.
+
 The **order** of that output matters. Escalation is announced before the call is attempted, so on failure the retraction and the low-confidence warning are printed *before* the answer:
 
 ```
@@ -342,6 +345,8 @@ Two properties are worth stating plainly, because savings figures invite overcla
 **Savings are counterfactual and labelled as such.** We never made the calls we avoided, so their cost cannot be measured — only estimated. The estimate prices each avoided call at the **measured mean** of the escalations that actually happened. Until at least one escalation completes there is no baseline, and the figures report `n/a` rather than guessing.
 
 **Failed escalations count as neither.** A request the router judged too hard for the local tier, where the frontier tier then failed, is not local sufficiency. Counting it as such would inflate the headline number with exactly the requests that disprove it, so it is tracked separately and excluded from the rate.
+
+**Local failures are counted on their own.** `Local tier failed` counts every request where the runtime failed a local sample, whatever happened next. If the frontier tier then answered, the request is also an ordinary escalation. If nothing answered, for example under `--local-only`, it lands in no rate bucket, just like a failed escalation.
 
 Actual frontier token counts come from the API's own `usage` field, and local counts from the SDK's — both exact.
 
@@ -425,7 +430,7 @@ In every model checked, the cause is its shipped `genai_config.json`, which the 
 
 **`Chat completion failed … Operation was cancelled`**
 
-The native core cancels any single non-streaming completion at **120 seconds**, and nothing in the SDK configures that. It is reached by large models running on the CPU, by reasoning models that think past the budget, and by any model when two inference processes share the machine. `sampleLocal` throws on it and the CLI exits without escalating, so a model that cannot finish K samples well inside that budget is not usable here.
+The native core cancels any single non-streaming completion at **120 seconds**, and nothing in the SDK configures that. It is reached by large models running on the CPU, by reasoning models that think past the budget, and by any model when two inference processes share the machine. The router treats it as a failed sample: it prints `[local model failed — …]`, stops sampling, and escalates. Completed drafts still go to the frontier tier as context. If escalation fails as well, one of those drafts is shown with a warning. If there are no drafts, the CLI says so and exits 1. Escalation can rescue a request, but a model that cannot finish K samples well inside the budget is still not usable as the local tier.
 
 **Everything escalates**
 
