@@ -3,6 +3,9 @@ node_modules/
 # Claude Code machine-local permission settings
 .claude/settings.local.json
 
+# Editor settings
+.vscode/
+
 # Benchmark scratch output
 compare-results.txt
 calib-out.txt
