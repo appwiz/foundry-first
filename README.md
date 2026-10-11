@@ -444,6 +444,10 @@ Exactly what it says — but note it is returned for *any* request body on an un
 
 [`package.json`](package.json) depends on `foundry-local-sdk-winml` while [`index.js`](index.js) imports `foundry-local-sdk`. This is intentional. The `-winml` package ships no API of its own — it is an installer wrapper that declares `foundry-local-sdk` as a dependency and fetches the **WinML** build of the native runtime instead of the standard one. You install the variant; you import the base package.
 
+**Why `package.json` overrides `adm-zip`**
+
+The SDK's install script unzips the native runtime with `adm-zip`. SDK 1.x pins `^0.5.16`, which cannot reach 0.6.1, the release that fixes three advisories: two decompression-bomb allocations and an extraction that follows symlinks. The `overrides` block lifts it. The extracted libraries are byte-identical to the ones 0.5.17 produced. The override can go once `foundry-local-sdk-winml` moves to SDK 2.x, which depends on `adm-zip ^0.6.0` itself.
+
 <a name="other-platforms"></a>
 **Other platforms**
 

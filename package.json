@@ -12,5 +12,8 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.115.0",
     "foundry-local-sdk-winml": "^1.2.3"
+  },
+  "overrides": {
+    "adm-zip": "^0.6.1"
   }
 }
