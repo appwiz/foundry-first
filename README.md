@@ -152,6 +152,20 @@ Paris.
 
 That reasoning is stripped before scoring and before display. It has to be: it is long, free-form, and varies far more between samples than the answer does, so leaving it in would swamp the agreement signal in exactly the way unconstrained prose did — **penalising a reasoning model for reasoning**. It also consumes most of the token budget before the answer starts, which is why the local cap is 1024 rather than 512; a lower cap truncates these models mid-thought, and the scorer then correctly disqualifies a sample that only the cap broke.
 
+Not every model emits the opening tag. The qwen3.5 chat template **prefills `<think>\n` into the prompt itself**, so the output starts mid-thought and carries only the closing tag:
+
+```
+Thinking Process:
+
+1.  **Analyze the Request:** ...
+6.  **Final Output Generation:** Au
+</think>
+
+Au
+```
+
+`stripThinking()` therefore also drops everything before an orphaned `</think>`. Before that was handled, the whole 214-token chain of thought reached the scorer and the user for a one-token answer.
+
 ### Choosing the local model
 
 Foundry Local's catalog runs from 0.5B to 20B parameters (`foundry model list`), so the default is a measurement rather than a preference. `--compare` runs the labelled set against each candidate:
@@ -183,8 +197,12 @@ Before scoring anything, `--compare` probes whether the runtime actually **sampl
 | `qwen3.5-0.8b` | 1/3 | ❌ greedy |
 | `qwen2.5-1.5b` | 1/3 | ❌ greedy |
 | `phi-3.5-mini` | 1/3 | ❌ greedy |
+| `olmo-3-7b-instruct` | 3/3 | ✅ |
+| `qwen3.5-9b` | 1/3 — 2/3 with `topK` override | ❌ greedy as configured |
+| `deepseek-r1-14b` | 1/3 — 3/3 with `topK` override | ❌ greedy as configured |
+| `gemma-4-e2b-it` | — | ❌ does not run on this runtime |
 
-Three of the five return **byte-identical text on every sample** — at temperature 1.5, with top-p 0.95, and with no seed set. Foundry Local decodes them greedily and ignores the temperature setting entirely:
+Three of the first five return **byte-identical text on every sample** — at temperature 1.5, with top-p 0.95, and with no seed set. Foundry Local decodes them greedily and ignores the temperature setting entirely:
 
 ```console
 $ node index.js --compare qwen2.5-1.5b
@@ -195,6 +213,8 @@ $ node index.js --compare qwen2.5-1.5b
 For those models agreement is a constant 1.0, nothing ever clears the escalation bar, and **the router silently degrades into "always answer locally"** — the failure documented for temperature 0, occurring here at temperature 0.7 through no fault of the configuration. It is silent because nothing errors: the local tier just quietly starts presenting fabrications as fact.
 
 This is what actually produced their terrible scores in the table below. Their `local-BAD` columns measure the runtime's decoding, not the model's judgement, so they are ranked last regardless of score and flagged `⚠`.
+
+**In every model checked, the cause is the model package, not the runtime.** Each variant ships a `genai_config.json` whose `search` block the runtime honours over the request. The stochastic models ship `"do_sample": true` with `top_k` of 40–50; `qwen3.5-9b` ships `"do_sample": false`, and `deepseek-r1-14b` and `gemma-4-e2b-it` ship `"top_k": 1`, so they always pick the argmax token. A per-request `topK` (`client.settings.topK`, sent as `metadata.top_k`) overrides it — that is how the two larger models were evaluated below. `sampleLocal` does not set `topK`, so as configured the project would see them as greedy. The earlier three greedy models are no longer cached, and neither their configs nor the override were checked on them.
 
 #### Results
 
@@ -209,7 +229,24 @@ This is what actually produced their terrible scores in the table below. Their `
 
 Between the two usable candidates, **`qwen2.5-0.5b` at threshold 0.76** wins on every axis: the same 9/20 answered locally and correctly, but **zero** wrong answers kept local against qwen3-0.6b's two, at 2.5× the speed and 2.3× fewer tokens (qwen3-0.6b spends most of its budget inside `<think>`).
 
-The uncomfortable implication is worth stating: this technique works here *because* the model is weak enough to be erratic. A more capable, more self-consistent model agrees with itself even when fabricating, and the signal degrades. Self-consistency is a confidence measure for models that are genuinely uncertain — not a general-purpose correctness oracle.
+#### Larger candidates
+
+A second run tried four much larger models: `olmo-3-7b-instruct`, `qwen3.5-9b`, `deepseek-r1-14b` and `gemma-4-e2b-it`. None of them is usable the way the project is configured. Without execution-provider registration the SDK offers only CPU variants, and on the CPU olmo (7B) and qwen3.5 (9B) managed roughly 1–3 tokens/s, so full-length samples overrun the native core's **120-second per-completion cap** (see [Troubleshooting](#troubleshooting)). So they were measured on the GPU (WebGPU on an Intel Arc 140V iGPU). The rows come from a runner that calls the same `sampleLocal`, `scoreSamples`, `isCorrect`, `bestThreshold` and `formatComparison`, and adds three things `--compare` cannot do today: register the GPU EPs, select a variant, and override `topK`. Prompts that hit the cap are counted as escalated. The incumbent was re-run in the same session as a control and reproduced its earlier row exactly.
+
+```
+  model              easy   hard    gap  thresh   local-ok  local-BAD  escalated   latency  tokens
+  qwen2.5-0.5b       0.94   0.29  -0.09   0.76        9/20         0         11     12.0s     567   CPU (control)
+  qwen3.5-9b         0.90   0.00  + 0.00   0.50        9/20         0         11    123.7s     417   GPU, topK 40, 11 timeouts
+  deepseek-r1-14b    0.88   0.00  + 0.00   0.42        9/20         0         11    147.3s     359   GPU, topK 40, 11 timeouts
+  olmo-3-7b-instruct 1.00   0.33  + 0.00   0.77       10/20         1          9     20.5s     313   GPU
+  gemma-4-e2b-it     does not run: onnxruntime-genai 0.14.1 rejects its architecture
+```
+
+**The incumbent still wins.** The two reasoning models tie it on paper, but only because **every hard prompt timed out** before its three samples finished. The router never scored one of their hard answers; the 120-second cap did all of their escalating. They also take 80–280 seconds per easy prompt (deepseek timed out on "7 × 8"), and as shipped they decode greedily.
+
+**`olmo-3-7b-instruct` is the only serious challenger, and it fails on the outcome that matters.** It answers more locally (10/20), every easy prompt reaches perfect agreement, and it correctly escalates its fabricated hard answers (the train "meets at 15:36", the tank is "1.31 m" deep). But asked to *prove* two identities, all three samples answered `n²` and nothing else, at agreement 1.00. That wrong answer stays local at **every** threshold. The terse system prompt that keeps the metric honest for the 0.5B model is what tips a 7B model into that answer. Adopting it would also mean adding GPU EP registration, and it is 1.7× slower per request.
+
+The uncomfortable implication is worth stating: this technique works here *because* the model is weak enough to be erratic. A more capable, more self-consistent model agrees with itself even when it is wrong, and the signal degrades. olmo's `n²` is that failure, measured. Self-consistency is a confidence measure for models that are genuinely uncertain — not a general-purpose correctness oracle.
 
 ### Calibrating the threshold
 
@@ -334,7 +371,7 @@ foundry-first/
 
 **Swap the local model.** Run `--compare old,new` before committing to one, and change `modelAlias` in `CONFIG` only if the new model is flagged usable. Two things will bite otherwise: most catalog models decode greedily, which makes the router silently stop escalating, and the threshold is a property of the model, so an inherited one will be wrong.
 
-Budget for it — every candidate is downloaded in full (the five-model run pulled ~7 GB into the shared cache, never evicted) and then run through 20 prompts × 3 samples. A greedy model can be ruled out in three calls, so probe before paying for a full evaluation.
+Budget for it — every candidate is downloaded in full (the five-model run pulled ~7 GB into the shared cache, never evicted) and then run through 20 prompts × 3 samples. A greedy model can be ruled out in three calls, so probe before paying for a full evaluation. Check the catalog size before downloading anything. The project runs every model on the CPU, where the 7B and 9B models measured there managed roughly 1–3 tokens/s (while sharing the CPU with a second run). At that speed anything longer than a few hundred tokens overruns the core's 120-second cap. Making it usable means registering GPU execution providers, which also downloads a second, GPU copy of every model. The four larger candidates above left ~66 GB in the cache.
 
 **Change the confidence metric.** [`lib/confidence.js`](lib/confidence.js) is self-contained: `scoreSamples` produces the score, `shouldEscalate` applies the policy. If a future SDK release populates `logprobs`, mean log-probability drops in as a replacement for `scoreSamples` with nothing else changing — and would remove the stochasticity requirement, since logprobs are readable from a single greedy sample.
 
@@ -384,7 +421,11 @@ Most likely the local model decodes greedily, making every sample identical and 
 ⚠ decodes greedily — ignores temperature, so self-consistency cannot measure it
 ```
 
-There is no fix — the technique cannot be used with such a model. Pick one the probe reports as usable. The same symptom appears if `temperature` is set to 0.
+In every model checked, the cause is its shipped `genai_config.json`, which the runtime honours over the request: a `search` block with `"do_sample": false` or `"top_k": 1` decodes greedily whatever `temperature` says. Check it under `%USERPROFILE%\.my-app\cache\models\Microsoft\<variant>\`. Overriding `top_k` per request (`client.settings.topK`, sent as metadata) restored sampling for `deepseek-r1-14b` (1/3 → 3/3 distinct) and partially for `qwen3.5-9b` (1/3 → 2/3); the project does not set it today, so such a model is unusable as configured. The same symptom appears if `temperature` is set to 0.
+
+**`Chat completion failed … Operation was cancelled`**
+
+The native core cancels any single non-streaming completion at **120 seconds**, and nothing in the SDK configures that. It is reached by large models running on the CPU, by reasoning models that think past the budget, and by any model when two inference processes share the machine. `sampleLocal` throws on it and the CLI exits without escalating, so a model that cannot finish K samples well inside that budget is not usable here.
 
 **Everything escalates**
 

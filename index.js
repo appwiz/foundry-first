@@ -29,7 +29,10 @@ const CONFIG = {
     // phi-3.5-mini via `--compare`. It wins for a non-obvious reason: most
     // catalog models decode greedily under Foundry Local regardless of
     // temperature, which makes every sample identical and self-consistency
-    // unusable. See the Choosing the local model section of README.md.
+    // unusable. Larger candidates (olmo-3-7b-instruct, qwen3.5-9b,
+    // deepseek-r1-14b, gemma-4-e2b-it) lose too: too slow for the core's
+    // 120s cap, greedy as shipped, unrunnable, or — olmo — confidently wrong.
+    // See the Choosing the local model section of README.md.
     modelAlias: 'qwen2.5-0.5b',
     sampleCount: 3,
     // Must be non-zero. At temperature 0 the model is deterministic, every
