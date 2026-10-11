@@ -65,17 +65,7 @@ First run downloads ~840MB of model weights; later runs hit the cache and start 
 
 **Frontier tier: `claude-opus-5` — verified end to end.** A real escalation returns content, so the request shape is confirmed accepted: adaptive thinking, streaming, and `fallbacks: "default"` with beta `server-side-fallback-2026-07-01` (note the array form of `fallbacks` uses a *different* header, `-2026-06-01`). Streaming, `usage` accounting, and metrics recording all work against the live API.
 
-**Testing it from this machine needs the WSL token bridge.** `ant` is installed under WSL, not Windows, so its OAuth profile is invisible to the Windows Node process. Pass it explicitly:
-
-```bash
-ANTHROPIC_AUTH_TOKEN=$(wsl ant auth print-credentials --access-token | tr -d '\r\n') node index.js "…"
-```
-
-```powershell
-$env:ANTHROPIC_AUTH_TOKEN = (wsl ant auth print-credentials --access-token).Trim()
-```
-
-Stripping whitespace matters — WSL emits a trailing CR that corrupts the header. The variable is per-shell, so a new terminal needs it again. The SDK sets the Bearer header itself; no explicit `oauth-2025-04-20` beta is needed. Tokens are short-lived (~1h), so re-run the substitution rather than caching it.
+**Everything runs natively on Windows — do not route anything through WSL.** `ant` ships as a native Windows binary (`winget install --id Anthropic.Ant -e`, the official Claude Platform CLI). `ant auth login` writes its profile to `%APPDATA%\Anthropic`, and the SDK's zero-arg constructor resolves exactly that directory on Windows (`getRootConfigPath` in `@anthropic-ai/sdk/core/credentials.mjs`), so escalation works with no `ANTHROPIC_*` variable set — verified end to end. `ant auth status` shows the active profile and its expiry. The SDK sets the Bearer header itself; no explicit `oauth-2025-04-20` beta is needed. An earlier WSL token bridge (`wsl ant auth print-credentials`) is obsolete; do not reintroduce it.
 
 **A 400 here may say nothing about your request.** The billing check runs *before* body validation: on an account with no credits, a valid body, a bogus beta header, and a `temperature` param that Opus 5 definitively rejects all return the identical `credit balance is too low` error. When debugging a 400, confirm the account has credit before touching the parameters.
 
@@ -134,7 +124,7 @@ Both tiers are verified end to end against real inference and a real API call. W
 
 **Not attempted, deliberately.** Multi-turn conversation (the SDK is stateless and the router is single-shot), tool calling, and the HTTP Responses API path.
 
-**To resume on another machine:** clone, `npm install`, then `node index.js --local-only "…"` exercises everything except the frontier tier without credentials. For the frontier tier, export `ANTHROPIC_API_KEY` or run `ant auth login` — the WSL bridge above is only needed where `ant` lives inside WSL rather than on the host. The first run re-downloads ~840MB of weights; `~/.my-app/` is machine-local and nothing in it needs to be carried across.
+**To resume on another machine:** clone, `npm install`, then `node index.js --local-only "…"` exercises everything except the frontier tier without credentials. For the frontier tier, export `ANTHROPIC_API_KEY` or run `ant auth login` with the native Windows `ant` described above. The first run re-downloads ~840MB of weights; `~/.my-app/` is machine-local and nothing in it needs to be carried across.
 
 ## Working agreement
 

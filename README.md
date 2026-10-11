@@ -66,19 +66,14 @@ To enable the frontier tier:
 export ANTHROPIC_API_KEY=sk-ant-...   # or: ant auth login
 ```
 
-If `ant` is installed under WSL rather than Windows, its profile is invisible to the Windows process — bridge the token across, stripping the trailing CR that would otherwise corrupt the header:
+On Windows, `ant` installs natively — no WSL involved:
 
 ```powershell
-# PowerShell
-$env:ANTHROPIC_AUTH_TOKEN = (wsl ant auth print-credentials --access-token).Trim()
+winget install --id Anthropic.Ant -e
+ant auth login        # in a new terminal; winget's PATH change needs one
 ```
 
-```bash
-# bash / git-bash
-export ANTHROPIC_AUTH_TOKEN=$(wsl ant auth print-credentials --access-token | tr -d '\r\n')
-```
-
-Tokens last about an hour, and the variable only lives for that shell session — re-run it in each new terminal.
+The login writes its profile under `%APPDATA%\Anthropic`, which is exactly where the SDK's zero-argument constructor looks on Windows, so no environment variable is needed — `ant auth status` confirms the profile and its expiry.
 
 ### Options
 
